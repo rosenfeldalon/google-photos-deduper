@@ -91,8 +91,6 @@ test.describe("healthCheck", () => {
     const stub = await openGptkStubPage(context, {
       healthCheck: {
         data: {
-          hasGptk: true,
-          hasWizData: true,
           accountEmail: "custom@example.com",
         },
       } as never,
@@ -247,17 +245,12 @@ test.describe("gptkCommand routing", () => {
 test.describe("chunked result relay", () => {
   test("relays a multi-chunk library to the app tab without loss", async () => {
     await clearStorage(context)
-    const stub = await openGptkStubPage(context)
+    const ITEMS = 25_000
+    const stub = await openGptkStubPage(context, { getAllMediaItems: { itemCount: ITEMS } })
     const page = await openAppTab(context, extensionId)
     await expect(
       page.getByRole("button", { name: /Scan Library/i })
     ).toBeVisible({ timeout: 10_000 })
-
-    // The override lives on the stub page, so set it there.
-    const ITEMS = 25_000
-    await stub.evaluate((n) => {
-      ;(window as any).__gptkOverrides = { getAllMediaItems: { itemCount: n } }
-    }, ITEMS)
 
     const result = await page.evaluate((requestIdSeed) => {
       return new Promise<{

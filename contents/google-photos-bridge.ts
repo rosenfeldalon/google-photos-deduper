@@ -1,103 +1,49 @@
 import type { PlasmoCSConfig } from "plasmo"
+import { executePhotosCommand } from "../lib/photos-commands"
+import { isInternalRequestId, parsePhotosCommand, parsePhotosSession } from "../lib/photos-protocol"
+import type { IsolatedPhotosCommand, PhotosReply } from "../lib/photos-protocol"
 import { APP_ID } from "../lib/types"
-import type {
-  AppMessage,
-  GptkResultChunkMessage,
-  GptkResultMessage,
-} from "../lib/types"
-
-// Bridge content script (ISOLATED world) for Google Photos pages.
-// Relays messages between:
-//   - MAIN world scripts (via window.postMessage) and
-//   - The extension service worker (via chrome.runtime messaging)
+import { createPhotosApi } from "../scripts/photos-api.generated.mjs"
 
 export const config: PlasmoCSConfig = {
   matches: ["https://photos.google.com/*"],
   run_at: "document_idle",
 }
 
-/**
- * Reports a failed relay back to the app so a lost message surfaces as an
- * error instead of an apparent hang.
- *
- * Only result messages can strand the app — it blocks waiting for them.
- * Progress and log messages are advisory, so a failure there is logged only.
- */
-function reportRelayFailure(msg: AppMessage, error: unknown): void {
-  const detail = error instanceof Error ? error.message : String(error)
-  console.error(
-    `[GPD] Failed to relay ${msg.action} to the service worker:`,
-    detail
-  )
-
-  if (msg.action !== "gptkResult" && msg.action !== "gptkResultChunk") return
-
-  const { command, requestId } = msg as
-    | GptkResultMessage
-    | GptkResultChunkMessage
-
-  try {
-    // Deliberately tiny, so it cannot fail for the same reason the original did.
-    chrome.runtime.sendMessage({
-      app: APP_ID,
-      action: "gptkResult",
-      command,
-      requestId,
-      success: false,
-      error: `Could not deliver the ${command} result: ${detail}`,
-    } as GptkResultMessage)
-  } catch (nested) {
-    console.error("[GPD] Failed to report the relay failure:", nested)
-  }
+function fromWorker(sender: chrome.runtime.MessageSender): boolean {
+  if (sender.id !== chrome.runtime.id || sender.tab !== undefined) return false
+  const background = chrome.runtime.getManifest().background
+  const worker = background && "service_worker" in background ? background.service_worker : undefined
+  return sender.url === undefined || (worker !== undefined && sender.url === chrome.runtime.getURL(worker))
 }
 
-/**
- * Relays one message to the service worker, converting any delivery failure
- * into a visible error.
- *
- * chrome.runtime.sendMessage throws *synchronously* when a message exceeds
- * Chrome's 64MiB cap. That exception used to escape the listener below
- * uncaught, which silently destroyed scan results for large libraries and left
- * the app waiting forever (#147). Results are chunked now, but any future
- * oversize or undeliverable payload must fail loudly rather than vanish.
- */
-function forwardToServiceWorker(msg: AppMessage): void {
-  try {
-    const pending = chrome.runtime.sendMessage(msg)
-    // Delivery can also fail asynchronously, e.g. no receiving end.
-    if (pending && typeof pending.catch === "function") {
-      pending.catch((error: unknown) => reportRelayFailure(msg, error))
-    }
-  } catch (error) {
-    reportRelayFailure(msg, error)
-  }
+async function deliver(reply: PhotosReply): Promise<void> {
+  // The service worker acknowledges only a pending command from this document.
+  // A transport failure or a stale command stops subsequent RPC batches.
+  if (await chrome.runtime.sendMessage(reply) !== true) throw new Error("Photos response was not acknowledged.")
 }
 
-// MAIN world -> service worker
-// Forward gptkResult, gptkResultChunk, gptkProgress, gptkLog messages.
-window.addEventListener("message", (event) => {
-  if (event.source !== window) return
-  const msg = event.data as AppMessage
-  if (msg?.app !== APP_ID) return
-
-  // Only forward GPTK result/progress/log messages to the service worker
-  if (
-    msg.action === "gptkResult" ||
-    msg.action === "gptkResultChunk" ||
-    msg.action === "gptkProgress" ||
-    msg.action === "gptkLog"
-  ) {
-    forwardToServiceWorker(msg)
+async function run(message: IsolatedPhotosCommand): Promise<void> {
+  const { command, args, requestId } = message
+  const session = parsePhotosSession(message.session)
+  const request = parsePhotosCommand(command, args)
+  if (!session || !request || request.command === "healthCheck") {
+    await deliver({
+      app: APP_ID, action: "gptkResult", command, requestId, success: false,
+      error: "The Photos bridge requires a valid session and command.",
+    })
+    return
   }
-})
+  await executePhotosCommand(request, requestId, session.path, createPhotosApi(session), deliver)
+}
 
-// Service worker -> MAIN world
-// Forward gptkCommand messages from the extension to the page.
-chrome.runtime.onMessage.addListener((message: AppMessage) => {
-  if (message?.app !== APP_ID) return
-  if (message.action === "gptkCommand") {
-    window.postMessage(message)
+chrome.runtime.onMessage.addListener((message, sender, respond) => {
+  if (message?.app !== APP_ID || !fromWorker(sender)) return
+  if (message.action === "photosProbe") {
+    respond(true)
+    return
   }
+  if (message.action !== "gptkCommand" || !isInternalRequestId(message.requestId)) return
+  void run(message).then(() => respond(), () => respond())
+  return true
 })
-
-console.log("GPD: Bridge content script loaded")

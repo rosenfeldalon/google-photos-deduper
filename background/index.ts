@@ -1,372 +1,322 @@
+import {
+  createRequestId, isInternalRequestId, MAX_RESULT_BYTES, PHOTOS_ORIGIN,
+  parsePhotosCommand, parsePhotosSession, serializedSize,
+} from "../lib/photos-protocol"
+import type { IsolatedPhotosCommand, PhotosReply, PhotosSession } from "../lib/photos-protocol"
 import { APP_ID } from "../lib/types"
-import type {
-  AppMessage,
-  GptkCommandMessage,
-  GptkResultMessage,
-  GptkResultChunkMessage,
-  GptkProgressMessage,
-} from "../lib/types"
+import type { AppMessage, GptkCommandMessage, GptkLogMessage } from "../lib/types"
 
-// Service worker for Google Photos Deduper.
-// Routes messages between the app tab and the Google Photos tab.
+interface DocumentTarget {
+  tabId: number
+  documentId: string
+}
 
-// Bidirectional tab mapping: appTabId <-> gpTabId
-const tabMap: Record<number, number> = {}
+interface AppTarget extends DocumentTarget {
+  openerTabId?: number
+}
 
-// Pending GPTK command callbacks, keyed by requestId
-const pendingCommands: Record<
-  string,
-  {
-    resolve: (data: unknown) => void
-    reject: (error: string) => void
-    appTabId: number
+interface VerifiedPhotos extends DocumentTarget {
+  session: PhotosSession
+}
+
+interface Pairing {
+  app: AppTarget
+  photos: DocumentTarget
+  account: string
+  path: string
+}
+
+interface PendingCommand {
+  pairing: Pairing
+  appRequestId: string
+  command: string
+  timeout?: ReturnType<typeof setTimeout>
+  chunks?: { total: number; received: Set<number> }
+}
+
+const appUrl = chrome.runtime.getURL("tabs/app.html")
+const pending = new Map<string, PendingCommand>()
+const PAIR_PREFIX = "photosPair:"
+const REQUEST_IDLE_MS = 90_000
+const CONNECT_ERROR = "Google Photos is disconnected. Reconnect and re-scan before continuing."
+
+function isPhotosUrl(url?: string): boolean {
+  try {
+    return url !== undefined && new URL(url).origin === PHOTOS_ORIGIN
+  } catch {
+    return false
   }
-> = {}
+}
 
-// ============================================================
-// Find tabs
-// ============================================================
+function senderDocument(sender: chrome.runtime.MessageSender): DocumentTarget | null {
+  const tabId = sender.tab?.id
+  if (sender.id !== chrome.runtime.id || tabId === undefined || sender.frameId !== 0 || !sender.documentId) return null
+  if (sender.documentLifecycle && sender.documentLifecycle !== "active") return null
+  return { tabId, documentId: sender.documentId }
+}
 
-/**
- * Find a Google Photos tab that the bridge content script can actually reach.
- *
- * When the user has multiple photos.google.com tabs open (e.g. opened before
- * the extension was installed, or duplicated via the "Open Google Photos"
- * button), picking the first one returned by chrome.tabs.query is unreliable:
- * the bridge may not be loaded in it, and chrome.tabs.sendMessage rejects with
- * "Receiving end does not exist", surfacing as a spurious "Cannot connect to
- * Google Photos" error.
- *
- * Strategy: prefer the active tab, then sort by lastAccessed descending, and
- * ping each one until we find a reachable bridge. The bridge ignores
- * unrecognized actions, so a no-op ping resolves with undefined when reachable
- * and rejects when no content script is present.
- */
-async function findGooglePhotosTab(): Promise<chrome.tabs.Tab | null> {
-  const tabs = await chrome.tabs.query({ url: "https://photos.google.com/*" })
-  if (tabs.length === 0) return null
+// This function is serialized by Chrome. Keep it self-contained and return only
+// bounded primitive fields. No operation, request argument, or listener enters MAIN.
+function readPageSession() {
+  if (location.origin !== "https://photos.google.com") return null
+  const wiz = (window as Window & { WIZ_global_data?: Record<string, unknown> }).WIZ_global_data
+  if (!wiz) return null
+  function text(value: unknown) {
+    return typeof value === "string" && value.length <= 16_384 ? value : null
+  }
+  return {
+    account: text(wiz.oPEP7c),
+    "f.sid": text(wiz.FdrFJe),
+    bl: text(wiz.cfb2h),
+    path: text(wiz.eptZe),
+    at: text(wiz.SNlM0e),
+  }
+}
 
-  // `lastAccessed` is available in Chrome 121+ but missing from this version
-  // of @types/chrome.
-  type TabWithLastAccessed = chrome.tabs.Tab & { lastAccessed?: number }
-  const sorted = [...tabs].sort((a, b) => {
-    if (a.active !== b.active) return a.active ? -1 : 1
-    const aAccessed = (a as TabWithLastAccessed).lastAccessed ?? 0
-    const bAccessed = (b as TabWithLastAccessed).lastAccessed ?? 0
-    return bAccessed - aAccessed
+async function readPhotos(tabId: number, documentId?: string): Promise<VerifiedPhotos | null> {
+  try {
+    // The pinned Chrome type package omits scripting's documentId fields.
+    const target: chrome.scripting.InjectionTarget & { documentIds?: string[] } =
+      documentId ? { tabId, documentIds: [documentId] } : { tabId, frameIds: [0] }
+    const results: (chrome.scripting.InjectionResult<unknown> & { documentId?: string })[] =
+      await chrome.scripting.executeScript({ target, world: "MAIN", func: readPageSession })
+    const [result] = results
+    if (
+      results.length !== 1 || result?.frameId !== 0 || !result.documentId ||
+      (documentId && result.documentId !== documentId)
+    ) return null
+    const session = parsePhotosSession(result.result)
+    return session ? { tabId, documentId: result.documentId, session } : null
+  } catch {
+    return null
+  }
+}
+
+async function findPhotos(openerTabId?: number): Promise<VerifiedPhotos | null> {
+  // Keep the toolbar's source tab first. A directly opened app uses the active
+  // or most recently accessed Photos tab that passes both browser probes.
+  type TabWithAccess = chrome.tabs.Tab & { lastAccessed?: number }
+  const tabs = await chrome.tabs.query({ url: PHOTOS_ORIGIN + "/*" }) as TabWithAccess[]
+  tabs.sort((a, b) => {
+    if (openerTabId !== undefined && a.id === openerTabId) return -1
+    if (openerTabId !== undefined && b.id === openerTabId) return 1
+    return Number(Boolean(b.active)) - Number(Boolean(a.active)) || (b.lastAccessed ?? 0) - (a.lastAccessed ?? 0)
   })
-
-  for (const candidate of sorted) {
-    if (!candidate.id) continue
+  for (const tab of tabs) {
+    if (tab.id === undefined || !isPhotosUrl(tab.url)) continue
+    const photos = await readPhotos(tab.id)
+    if (!photos) continue
     try {
-      await chrome.tabs.sendMessage(candidate.id, {
-        app: APP_ID,
-        action: "ping",
-      })
-      return candidate
+      const ready = await sendToDocument(photos, { app: APP_ID, action: "photosProbe" })
+      if (ready === true) return photos
     } catch {
-      // Bridge not loaded in this tab; try the next one.
+      // This document has no isolated bridge. Continue to the next candidate.
     }
   }
   return null
 }
 
-/**
- * Get the sender's tab ID. For content scripts, sender.tab is set.
- * For extension pages (tabs/app.html), sender.tab is undefined —
- * we resolve it from sender.url via chrome.tabs.query.
- */
-async function getSenderTabId(
-  sender: chrome.runtime.MessageSender
-): Promise<number | null> {
-  if (sender.tab?.id) return sender.tab.id
-
-  // Extension page: find tab by URL
-  if (sender.url) {
-    const tabs = await chrome.tabs.query({ url: sender.url })
-    if (tabs.length > 0 && tabs[0].id) return tabs[0].id
-  }
-  return null
+function sendToDocument(target: DocumentTarget, message: object) {
+  return chrome.tabs.sendMessage(target.tabId, message, { documentId: target.documentId })
 }
 
-// ============================================================
-// Send a GPTK command to the Google Photos tab and await result
-// ============================================================
-
-function generateRequestId(): string {
-  return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+function sameAccount(photos: VerifiedPhotos | null, pairing: Pairing): photos is VerifiedPhotos {
+  return photos !== null && photos.session.account === pairing.account && photos.session.path === pairing.path
 }
 
-async function sendGptkCommand(
-  gpTabId: number,
-  command: string,
-  args?: unknown
-): Promise<unknown> {
-  const requestId = generateRequestId()
-
-  const message: GptkCommandMessage = {
-    app: APP_ID,
-    action: "gptkCommand",
-    command,
-    requestId,
-    args,
+async function replyToApp(app: DocumentTarget, message: AppMessage): Promise<boolean> {
+  try {
+    await sendToDocument(app, message)
+    return true
+  } catch {
+    // The app may have closed or navigated.
+    return false
   }
+}
 
-  return new Promise((resolve, reject) => {
-    pendingCommands[requestId] = { resolve, reject, appTabId: 0 }
-    chrome.tabs.sendMessage(gpTabId, message).catch(() => {
-      delete pendingCommands[requestId]
-      reject(
-        "Unable to connect to Google Photos tab. Please reload the tab and try again."
-      )
-    })
+function finish(id: string): void {
+  clearTimeout(pending.get(id)?.timeout)
+  pending.delete(id)
+}
+
+function fail(id: string, error: string): void {
+  const entry = pending.get(id)
+  if (!entry) return
+  finish(id)
+  void replyToApp(entry.pairing.app, {
+    app: APP_ID, action: "gptkResult", command: entry.command,
+    requestId: entry.appRequestId, success: false, error,
   })
 }
 
-// ============================================================
-// Message handler
-// ============================================================
-
-chrome.runtime.onMessage.addListener(
-  (message: AppMessage, sender: chrome.runtime.MessageSender) => {
-    if (message?.app !== APP_ID) return
-
-    switch (message.action) {
-      case "launchApp":
-        handleLaunchApp(sender)
-        break
-      case "healthCheck":
-        handleHealthCheck(sender)
-        break
-      case "gptkCommand":
-        handleGptkCommand(message as GptkCommandMessage, sender)
-        break
-      case "gptkResult":
-        handleGptkResult(message as GptkResultMessage, sender)
-        break
-      case "gptkResultChunk":
-        handleGptkResultChunk(message as GptkResultChunkMessage, sender)
-        break
-      case "gptkProgress":
-        handleGptkProgress(message as GptkProgressMessage, sender)
-        break
-    }
-  }
-)
-
-// ============================================================
-// Handlers
-// ============================================================
-
-async function handleLaunchApp(
-  sender: chrome.runtime.MessageSender
-): Promise<void> {
-  const appTab = await chrome.tabs.create({
-    url: chrome.runtime.getURL("tabs/app.html"),
-  })
-  if (sender.tab?.id && appTab.id) {
-    tabMap[sender.tab.id] = appTab.id
-    tabMap[appTab.id] = sender.tab.id
-  }
+function arm(id: string, entry: PendingCommand): void {
+  clearTimeout(entry.timeout)
+  entry.timeout = setTimeout(() => fail(id,
+    "Google Photos stopped responding. Check Photos before retrying the operation."
+  ), REQUEST_IDLE_MS)
 }
 
-async function handleHealthCheck(
-  sender: chrome.runtime.MessageSender
-): Promise<void> {
-  const senderTabId = await getSenderTabId(sender)
-
-  const gpTab = await findGooglePhotosTab()
-  if (!gpTab?.id) {
-    if (senderTabId) {
-      chrome.tabs.sendMessage(senderTabId, {
-        app: APP_ID,
-        action: "healthCheck.result",
-        success: false,
-        hasGptk: false,
-      })
+async function connect(app: AppTarget): Promise<void> {
+  let photos: VerifiedPhotos | null = null
+  const key = PAIR_PREFIX + app.documentId
+  try {
+    await chrome.storage.session.remove(key)
+    photos = await findPhotos(app.openerTabId)
+    if (photos) {
+      const { tabId, documentId, session } = photos
+      const pairing: Pairing = { app, photos: { tabId, documentId }, account: session.account, path: session.path }
+      // Session storage survives MV3 suspension. RPC tokens never enter storage.
+      await chrome.storage.session.set({ [key]: pairing })
     }
+  } catch {
+    photos = null
+  }
+  await replyToApp(app, {
+    app: APP_ID, action: "healthCheck.result", success: photos !== null, hasGptk: photos !== null,
+    ...(photos ? { accountEmail: photos.session.account } : {}),
+  })
+}
+
+async function start(app: AppTarget, message: GptkCommandMessage): Promise<void> {
+  if (typeof message.requestId !== "string" || !message.requestId || message.requestId.length > 128 ||
+      typeof message.command !== "string" || message.command.length > 64) return
+  const errorReply = (error: string) => replyToApp(app, {
+    app: APP_ID, action: "gptkResult", command: message.command,
+    requestId: message.requestId, success: false, error,
+  })
+
+  const command = parsePhotosCommand(message.command, message.args)
+  if (!command) {
+    await errorReply("Invalid Photos command or arguments.")
+    return
+  }
+  const key = PAIR_PREFIX + app.documentId
+  const pairing = (await chrome.storage.session.get(key))[key] as Pairing | undefined
+  if (!pairing || pairing.app.tabId !== app.tabId) {
+    await errorReply(CONNECT_ERROR)
     return
   }
 
-  // Map the app tab to the GP tab
-  if (senderTabId && gpTab.id) {
-    tabMap[senderTabId] = gpTab.id
-    tabMap[gpTab.id] = senderTabId
+  const photos = await readPhotos(pairing.photos.tabId, pairing.photos.documentId)
+  if (!sameAccount(photos, pairing)) {
+    await errorReply(CONNECT_ERROR)
+    return
+  }
+  if (command.command === "healthCheck") {
+    await replyToApp(app, {
+      app: APP_ID, action: "gptkResult", command: "healthCheck", requestId: message.requestId,
+      success: true, data: { hasGptk: true, hasWizData: true, accountEmail: pairing.account },
+    })
+    return
   }
 
+  if (Array.from(pending.values()).some(entry =>
+    entry.pairing.app.documentId === app.documentId && entry.appRequestId === message.requestId
+  )) return
+  const id = createRequestId()
+  const entry: PendingCommand = { pairing, appRequestId: message.requestId, command: command.command }
+  const isolated: IsolatedPhotosCommand = {
+    app: APP_ID, action: "gptkCommand", command: command.command, args: message.args,
+    requestId: id, session: photos.session,
+  }
+  pending.set(id, entry)
+  arm(id, entry)
   try {
-    const result = await sendGptkCommand(gpTab.id, "healthCheck")
-    if (senderTabId) {
-      const r = result as { hasGptk: boolean; accountEmail?: string }
-      chrome.tabs.sendMessage(senderTabId, {
-        app: APP_ID,
-        action: "healthCheck.result",
-        success: true,
-        hasGptk: r.hasGptk,
-        accountEmail: r.accountEmail,
-      })
-    }
+    await sendToDocument(photos, isolated)
   } catch {
-    if (senderTabId) {
-      chrome.tabs.sendMessage(senderTabId, {
-        app: APP_ID,
-        action: "healthCheck.result",
-        success: false,
-        hasGptk: false,
-      })
-    }
+    fail(id, CONNECT_ERROR)
   }
 }
 
-async function handleGptkCommand(
-  message: GptkCommandMessage,
-  sender: chrome.runtime.MessageSender
-): Promise<void> {
-  const senderTabId = await getSenderTabId(sender)
-  if (!senderTabId) return
+async function relay(message: PhotosReply, source: DocumentTarget): Promise<boolean> {
+  if (!isInternalRequestId(message.requestId)) return false
+  const entry = pending.get(message.requestId)
+  if (!entry || entry.command !== message.command ||
+      entry.pairing.photos.tabId !== source.tabId ||
+      entry.pairing.photos.documentId !== source.documentId) return false
 
-  // Find the GP tab for this sender
-  let gpTabId = tabMap[senderTabId]
-  if (!gpTabId) {
-    const gpTab = await findGooglePhotosTab()
-    if (!gpTab?.id) {
-      chrome.tabs.sendMessage(senderTabId, {
-        app: APP_ID,
-        action: "gptkResult",
-        command: message.command,
-        requestId: message.requestId,
-        success: false,
-        error: "Google Photos tab not found. Please open photos.google.com.",
-      } as GptkResultMessage)
-      return
+  if (serializedSize(message) > MAX_RESULT_BYTES) {
+    fail(message.requestId, "A Photos response exceeded the bridge size limit.")
+    return false
+  }
+
+  if (message.action === "gptkProgress") {
+    if (!Number.isSafeInteger(message.itemsProcessed) || message.itemsProcessed < 0) return false
+    if (entry.command === "trashItems" || entry.command === "restoreItems") {
+      const photos = await readPhotos(source.tabId, source.documentId)
+      if (pending.get(message.requestId) !== entry) return false
+      if (!sameAccount(photos, entry.pairing)) {
+        fail(message.requestId, CONNECT_ERROR)
+        return false
+      }
     }
-    gpTabId = gpTab.id
-    tabMap[senderTabId] = gpTabId
-    tabMap[gpTabId] = senderTabId
-  }
-
-  // Store the sender so we can relay results back
-  pendingCommands[message.requestId] = {
-    resolve: () => {},
-    reject: () => {},
-    appTabId: senderTabId,
-  }
-
-  // Forward the command to the GP tab (bridge will relay to MAIN world)
-  chrome.tabs.sendMessage(gpTabId, message).catch(() => {
-    chrome.tabs.sendMessage(senderTabId, {
-      app: APP_ID,
-      action: "gptkResult",
-      command: message.command,
-      requestId: message.requestId,
-      success: false,
-      error:
-        "Unable to connect to Google Photos tab. Please reload the tab and try again.",
-    } as GptkResultMessage)
-    delete pendingCommands[message.requestId]
-  })
-}
-
-function handleGptkResult(
-  message: GptkResultMessage,
-  _sender: chrome.runtime.MessageSender
-): void {
-  const pending = pendingCommands[message.requestId]
-  if (!pending) return
-
-  // Relay result to the app tab
-  if (pending.appTabId) {
-    chrome.tabs.sendMessage(pending.appTabId, message).catch((error) => {
-      // Nothing to relay an error to — the app tab *is* the destination — so
-      // log it and let the app's own watchdog surface the stall.
-      console.error("[GPD] Failed to relay result to the app tab:", error)
-    })
-  }
-
-  // Resolve/reject the promise if anyone is awaiting
-  if (message.success) {
-    pending.resolve(message.data)
+    arm(message.requestId, entry)
+  } else if (message.action === "gptkResultChunk") {
+    if (!Array.isArray(message.data) || !Number.isSafeInteger(message.chunkIndex) ||
+        !Number.isSafeInteger(message.totalChunks) || message.totalChunks > 10_000 ||
+        message.chunkIndex < 0 || message.chunkIndex >= message.totalChunks) return false
+    const chunks = entry.chunks ??= { total: message.totalChunks, received: new Set() }
+    if (chunks.total !== message.totalChunks || chunks.received.has(message.chunkIndex)) return false
+    chunks.received.add(message.chunkIndex)
+    if (chunks.received.size === chunks.total) finish(message.requestId)
+    else arm(message.requestId, entry)
   } else {
-    pending.reject(message.error || "Unknown error")
+    if (typeof message.success !== "boolean") return false
+    finish(message.requestId)
   }
 
-  delete pendingCommands[message.requestId]
+  const delivered = await replyToApp(entry.pairing.app, { ...message, requestId: entry.appRequestId })
+  if (!delivered) finish(message.requestId)
+  return delivered
 }
 
-/**
- * Relays one chunk of a chunked result to the app tab.
- *
- * The pending command stays registered until the final chunk arrives, so a
- * multi-chunk result is not torn down halfway through.
- */
-function handleGptkResultChunk(
-  message: GptkResultChunkMessage,
-  _sender: chrome.runtime.MessageSender
-): void {
-  const pending = pendingCommands[message.requestId]
-  if (!pending) return
-
-  if (pending.appTabId) {
-    chrome.tabs.sendMessage(pending.appTabId, message).catch((error) => {
-      console.error(
-        `[GPD] Failed to relay result chunk ${message.chunkIndex + 1}/${message.totalChunks} to the app tab:`,
-        error
-      )
-    })
-  }
-
-  if (message.chunkIndex >= message.totalChunks - 1) {
-    pending.resolve(undefined)
-    delete pendingCommands[message.requestId]
-  }
-}
-
-function handleGptkProgress(
-  message: GptkProgressMessage,
-  _sender: chrome.runtime.MessageSender
-): void {
-  const pending = pendingCommands[message.requestId]
-  if (!pending?.appTabId) return
-
-  // Relay progress to the app tab. Progress is advisory — a dropped update
-  // must not produce an unhandled rejection.
-  chrome.tabs.sendMessage(pending.appTabId, message).catch(() => {})
-}
-
-// ============================================================
-// Tab cleanup
-// ============================================================
-
-chrome.tabs.onRemoved.addListener((tabId) => {
-  const mappedTabId = tabMap[tabId]
-  if (mappedTabId) {
-    delete tabMap[mappedTabId]
-
-    // If a GP tab closed, notify the app tab
-    chrome.tabs
-      .sendMessage(mappedTabId, {
-        app: APP_ID,
-        action: "gptkLog",
-        level: "error",
-        message: "Google Photos tab was closed.",
-      })
-      .catch(() => {
-        // App tab may also be gone
-      })
-  }
-  delete tabMap[tabId]
-
-  // Clean up any pending commands from this tab
-  for (const [reqId, cmd] of Object.entries(pendingCommands)) {
-    if (cmd.appTabId === tabId) {
-      delete pendingCommands[reqId]
+chrome.runtime.onMessage.addListener((message: AppMessage, sender, respond) => {
+  if (message?.app !== APP_ID) return
+  const source = senderDocument(sender)
+  if (!source) return
+  if (sender.url === appUrl) {
+    const app = { ...source, openerTabId: sender.tab?.openerTabId }
+    if (message.action === "healthCheck") {
+      void connect(app).then(() => respond(), () => respond())
+      return true
+    }
+    if (message.action === "gptkCommand") {
+      void start(app, message).then(() => respond(), () => respond())
+      return true
+    }
+  } else if (isPhotosUrl(sender.url)) {
+    if (message.action === "gptkResult" || message.action === "gptkResultChunk" || message.action === "gptkProgress") {
+      void relay(message, source).then(respond, () => respond(false))
+      return true
     }
   }
 })
 
-// Open the app tab when the extension icon is clicked
-chrome.action.onClicked.addListener(() => {
-  chrome.tabs.create({ url: chrome.runtime.getURL("tabs/app.html") })
+async function forgetTab(tabId: number): Promise<void> {
+  const stored = await chrome.storage.session.get()
+  for (const [key, value] of Object.entries(stored)) {
+    if (!key.startsWith(PAIR_PREFIX)) continue
+    const pairing = value as Pairing
+    if (pairing.app.tabId !== tabId && pairing.photos.tabId !== tabId) continue
+    await chrome.storage.session.remove(key)
+    if (pairing.photos.tabId === tabId && pairing.app.tabId !== tabId) {
+      const message: GptkLogMessage = {
+        app: APP_ID, action: "gptkLog", level: "error", message: "Google Photos tab was closed.",
+      }
+      await replyToApp(pairing.app, message)
+    }
+  }
+}
+
+chrome.tabs.onRemoved.addListener(tabId => {
+  for (const [id, entry] of pending) {
+    if (entry.pairing.app.tabId === tabId) finish(id)
+    else if (entry.pairing.photos.tabId === tabId) fail(id, CONNECT_ERROR)
+  }
+  void forgetTab(tabId).catch(() => {})
 })
 
-console.log("GPD: Service worker loaded")
+chrome.action.onClicked.addListener(tab => {
+  const openerTabId = isPhotosUrl(tab.url) ? tab.id : undefined
+  void chrome.tabs.create({ url: appUrl, ...(openerTabId === undefined ? {} : { openerTabId }) }).catch(() => {})
+})

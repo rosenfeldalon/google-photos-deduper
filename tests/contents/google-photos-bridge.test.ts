@@ -1,178 +1,117 @@
-/**
- * Tests for contents/google-photos-bridge.ts
- *
- * The bridge is an ISOLATED world content script that relays MAIN world
- * window.postMessage traffic to the service worker. Tests drive it by
- * dispatching MessageEvents and inspecting chrome.runtime.sendMessage.
- *
- * @vitest-environment happy-dom
- */
-import { describe, it, expect, vi, beforeAll, beforeEach } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { APP_ID } from "../../lib/types"
 
-const mockSendMessage = vi.fn()
+const api = vi.hoisted(() => ({
+  getItemsByTakenDate: vi.fn(),
+  moveItemsToTrash: vi.fn(),
+  restoreFromTrash: vi.fn(),
+}))
+const createApi = vi.hoisted(() => vi.fn(() => api))
+vi.mock("../../scripts/photos-api.generated.mjs", () => ({ createPhotosApi: createApi }))
 
-const mockChrome = {
-  runtime: {
-    sendMessage: mockSendMessage,
-    getURL: vi.fn((p: string) => `chrome-extension://test/${p}`),
-    getManifest: vi.fn(() => ({ version: "0.0.0" })),
-    onMessage: { addListener: vi.fn() },
-  },
+let listener: (message: unknown, sender: chrome.runtime.MessageSender, respond: (value?: unknown) => void) => boolean | void
+const worker = { id: "test", url: "chrome-extension://test/background.worker.js" }
+const sendMessage = vi.fn()
+const session = { account: "fixture@example.test", "f.sid": "123", bl: "version", path: "/", at: "test-data" }
+const request = {
+  app: APP_ID,
+  action: "gptkCommand",
+  command: "trashItems",
+  args: { dedupKeys: ["fixture-key"] },
+  requestId: "f".repeat(32),
+  session,
 }
 
-vi.stubGlobal("chrome", mockChrome)
+function receive(message: unknown, sender: chrome.runtime.MessageSender = worker) {
+  return new Promise(resolve => {
+    if (listener(message, sender, resolve) !== true) resolve(undefined)
+  })
+}
 
-beforeAll(async () => {
+beforeEach(async () => {
+  vi.resetModules()
+  vi.clearAllMocks()
+  sendMessage.mockResolvedValue(true)
+  api.moveItemsToTrash.mockResolvedValue(undefined)
+  vi.stubGlobal("chrome", {
+    runtime: {
+      id: "test",
+      getURL: (path: string) => `chrome-extension://test/${path}`,
+      getManifest: () => ({ background: { service_worker: "background.worker.js" } }),
+      sendMessage,
+      onMessage: {
+        addListener: (callback: typeof listener) => { listener = callback },
+      },
+    },
+  })
   await import("../../contents/google-photos-bridge")
 })
 
-beforeEach(() => {
-  mockSendMessage.mockReset()
-  mockSendMessage.mockResolvedValue(undefined)
-  vi.spyOn(console, "error").mockImplementation(() => {})
+afterEach(() => {
+  vi.restoreAllMocks()
+  vi.unstubAllGlobals()
 })
 
-/** Dispatch a message the way a MAIN world script does. */
-function postFromPage(data: unknown) {
-  window.dispatchEvent(
-    new MessageEvent("message", { source: window, data })
-  )
-}
+describe("isolated Photos bridge", () => {
+  it("responds to an authenticated reachability probe", async () => {
+    expect(await receive({ app: APP_ID, action: "photosProbe" })).toBe(true)
+  })
 
-/** Messages the bridge actually handed to chrome.runtime.sendMessage. */
-function forwarded() {
-  return mockSendMessage.mock.calls.map((c) => c[0])
-}
-
-describe("bridge — message forwarding", () => {
   it.each([
-    "gptkResult",
-    "gptkResultChunk",
-    "gptkProgress",
-    "gptkLog",
-  ])("forwards %s to the service worker", (action) => {
-    postFromPage({ app: APP_ID, action, command: "getAllMediaItems", requestId: "r1" })
-    expect(forwarded()).toHaveLength(1)
-    expect(forwarded()[0].action).toBe(action)
+    { ...worker, id: "different-extension" },
+    { ...worker, tab: { id: 10 } as chrome.tabs.Tab },
+    { ...worker, url: "chrome-extension://test/tabs/app.html" },
+  ])("rejects a command from an untrusted sender (%j)", async sender => {
+    await receive(request, sender)
+    expect(createApi).not.toHaveBeenCalled()
+    expect(sendMessage).not.toHaveBeenCalled()
   })
 
-  it("ignores messages from other apps", () => {
-    postFromPage({ app: "SOMETHING_ELSE", action: "gptkResult" })
-    expect(mockSendMessage).not.toHaveBeenCalled()
+  it("ignores every page-window message and leaves no API globals", async () => {
+    const postMessage = vi.spyOn(window, "postMessage")
+    window.dispatchEvent(new MessageEvent("message", { source: window, data: { ...request, session: undefined } }))
+    window.dispatchEvent(new MessageEvent("message", { source: window, data: { ...request, action: "gptkResult" } }))
+    window.dispatchEvent(new MessageEvent("message", { source: window, data: { ...request, action: "gptkProgress" } }))
+    for (const key of ["gptkApi", "gptkCore", "gptkApiUtils", "unsafeWindow"]) {
+      expect(Object.hasOwn(window, key)).toBe(false)
+    }
+    expect(postMessage).not.toHaveBeenCalled()
+    expect(sendMessage).not.toHaveBeenCalled()
+    expect(createApi).not.toHaveBeenCalled()
   })
 
-  it("ignores actions it does not relay", () => {
-    postFromPage({ app: APP_ID, action: "gptkCommand", command: "x", requestId: "r1" })
-    expect(mockSendMessage).not.toHaveBeenCalled()
-  })
-})
-
-describe("bridge — delivery failures surface as errors", () => {
-  // Chrome throws this synchronously, which is what made #147 a silent hang.
-  const OVERSIZE = "Message exceeded maximum allowed size of 64MiB."
-
-  it("reports a synchronous send failure as a failed gptkResult", () => {
-    mockSendMessage.mockImplementationOnce(() => {
-      throw new Error(OVERSIZE)
-    })
-
-    postFromPage({
-      app: APP_ID,
-      action: "gptkResult",
-      command: "getAllMediaItems",
-      requestId: "req-1",
-      success: true,
-      data: [],
-    })
-
-    const reply = forwarded()[1]
-    expect(reply).toMatchObject({
-      app: APP_ID,
-      action: "gptkResult",
-      command: "getAllMediaItems",
-      requestId: "req-1",
-      success: false,
-    })
-    expect(reply.error).toContain(OVERSIZE)
-    // The error reply must not carry the payload that failed to send
-    expect(reply.data).toBeUndefined()
+  it("requires a valid request ID, session and command payload", async () => {
+    await receive({ ...request, requestId: "bad" })
+    await receive({ ...request, session: undefined })
+    await receive({ ...request, args: { dedupKeys: ["fixture-key", "fixture-key"] } })
+    await receive({ ...request, command: "unknown" })
+    expect(createApi).not.toHaveBeenCalled()
+    expect(sendMessage.mock.calls.map(([reply]) => reply.success)).toEqual([false, false, false])
   })
 
-  it("reports a failed chunk against the same requestId", () => {
-    mockSendMessage.mockImplementationOnce(() => {
-      throw new Error(OVERSIZE)
-    })
-
-    postFromPage({
-      app: APP_ID,
-      action: "gptkResultChunk",
-      command: "getAllMediaItems",
-      requestId: "req-2",
-      chunkIndex: 0,
-      totalChunks: 3,
-      data: [],
-    })
-
-    expect(forwarded()[1]).toMatchObject({
-      action: "gptkResult",
-      command: "getAllMediaItems",
-      requestId: "req-2",
-      success: false,
-    })
+  it("executes with a request-local session and replies directly to the worker", async () => {
+    const postMessage = vi.spyOn(window, "postMessage")
+    await receive(request)
+    expect(createApi).toHaveBeenCalledExactlyOnceWith(session)
+    expect(api.moveItemsToTrash).toHaveBeenCalledExactlyOnceWith(["fixture-key"])
+    expect(sendMessage.mock.calls.map(([reply]) => [reply.action, reply.requestId])).toEqual([
+      ["gptkProgress", request.requestId], ["gptkResult", request.requestId],
+    ])
+    expect(JSON.stringify(sendMessage.mock.calls)).not.toContain(session.at)
+    expect(postMessage).not.toHaveBeenCalled()
   })
 
-  it("reports an asynchronous send rejection", async () => {
-    mockSendMessage.mockRejectedValueOnce(
-      new Error("Could not establish connection.")
-    )
+  it.each(["rejected", "thrown", "stale"])("halts remaining batches after a %s acknowledgement", async failure => {
+    if (failure === "rejected") sendMessage.mockRejectedValueOnce(new Error("send failed"))
+    else if (failure === "thrown") sendMessage.mockImplementationOnce(() => { throw new Error("send failed") })
+    else sendMessage.mockResolvedValueOnce(false)
 
-    postFromPage({
-      app: APP_ID,
-      action: "gptkResult",
-      command: "getAllMediaItems",
-      requestId: "req-3",
-      success: true,
+    await receive({
+      ...request, args: { dedupKeys: Array.from({ length: 252 }, (_, index) => "fixture-key-" + index) },
     })
-    await Promise.resolve()
-    await Promise.resolve()
-
-    expect(forwarded()[1]).toMatchObject({
-      action: "gptkResult",
-      requestId: "req-3",
-      success: false,
-    })
-  })
-
-  it("does not send an error reply for advisory progress messages", () => {
-    mockSendMessage.mockImplementationOnce(() => {
-      throw new Error(OVERSIZE)
-    })
-
-    postFromPage({
-      app: APP_ID,
-      action: "gptkProgress",
-      requestId: "req-4",
-      itemsProcessed: 10,
-    })
-
-    // Logged, but no follow-up message — progress is not what the app waits on
-    expect(forwarded()).toHaveLength(1)
-  })
-
-  it("does not throw when reporting the failure also fails", () => {
-    mockSendMessage.mockImplementation(() => {
-      throw new Error(OVERSIZE)
-    })
-
-    expect(() =>
-      postFromPage({
-        app: APP_ID,
-        action: "gptkResult",
-        command: "getAllMediaItems",
-        requestId: "req-5",
-        success: true,
-      })
-    ).not.toThrow()
+    expect(api.moveItemsToTrash).toHaveBeenCalledTimes(1)
+    expect(sendMessage).toHaveBeenLastCalledWith(expect.objectContaining({
+      action: "gptkResult", requestId: request.requestId, success: false,
+    }))
   })
 })
