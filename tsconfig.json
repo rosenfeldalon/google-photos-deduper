@@ -3,7 +3,8 @@
   "exclude": [
     "node_modules",
     "workers",
-    "vitest.config.ts"
+    "vitest.config.ts",
+    "Google-Photos-Toolkit"
   ],
   "include": [
     ".plasmo/index.d.ts",
