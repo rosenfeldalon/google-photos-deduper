@@ -28,6 +28,8 @@ Uses [Google Photos Toolkit (GPTK)](https://github.com/xob0t/Google-Photos-Toolk
 
 Album and ownership details load for photos in duplicate groups. Confirm the suggested Photos owner before selecting copies for trash. Partner, shared and unverified copies stay protected. Photos you own in a shared album require individual selection. Older scans without an associated account stay viewable and require a new scan before trash is available.
 
+Trash moves are paced and can pause if Photos stops acknowledging batches. Use **Resume** to retry the remaining selection or **Stop** to return to the scan with acknowledged moves applied. If a batch timed out, check Photos before resuming.
+
 No OAuth setup. No Google Cloud project. No data leaves your browser.
 
 ## Development

@@ -1,3 +1,5 @@
+import type { TrashBatchState } from "./trash-batches"
+
 // Shared message types for communication between extension components.
 // All messages include `app: "GPD"` to filter out unrelated messages.
 
@@ -143,6 +145,7 @@ export interface GptkProgressMessage extends BaseMessage {
   requestId: string;
   itemsProcessed: number;
   totalItems?: number;
+  trashState?: TrashBatchState & { trashedKeys?: string[] };
   message?: string;
   /** Set by batch operations (e.g. "trashItems") so the app can route progress correctly. */
   command?: string;

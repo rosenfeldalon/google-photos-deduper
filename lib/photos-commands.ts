@@ -2,12 +2,12 @@ import type Api from "../Google-Photos-Toolkit/src/api/api"
 import { loadPhotoDetails, PHOTO_DETAILS_BATCH_SIZE } from "./photo-details"
 import { MAX_RESULT_BYTES, PHOTOS_ORIGIN, serializedSize } from "./photos-protocol"
 import type { PhotosCommand, PhotosReply } from "./photos-protocol"
+import { runTrashBatches, TRASH_BATCH_SIZE } from "./trash-batches"
 import { APP_ID, type GpdMediaItem } from "./types"
 
 export type PhotosApi = Pick<Api, "getItemsByTakenDate" | "getItemInfoExt" | "moveItemsToTrash" | "restoreFromTrash">
 type Emit = (reply: PhotosReply) => void | Promise<void>
 
-const BATCH_SIZE = 250
 const RESULT_CHUNK_SIZE = 10_000
 const PAGE_TIMEOUT_MS = 60_000
 
@@ -124,24 +124,41 @@ export async function executePhotosCommand(
     if (command === "healthCheck") return
 
     const { dedupKeys } = request
-    const isTrash = command === "trashItems"
-    for (let offset = 0; offset < dedupKeys.length; offset += BATCH_SIZE) {
-      const batch = dedupKeys.slice(offset, offset + BATCH_SIZE)
-      if (isTrash) await api.moveItemsToTrash(batch)
-      else await api.restoreFromTrash(batch)
+    if (command === "trashItems") {
+      const { mediaKeysPerDedup, mediaKeysToTrash } = request
+      function mediaAcknowledged(count: number): string[] {
+        if (count === dedupKeys.length) return mediaKeysToTrash
+        if (mediaKeysPerDedup) {
+          const total = mediaKeysPerDedup.slice(0, count).reduce((sum, size) => sum + size, 0)
+          return mediaKeysToTrash.slice(0, total)
+        }
+        return mediaKeysToTrash.length === dedupKeys.length ? mediaKeysToTrash.slice(0, count) : []
+      }
+      const batch = await runTrashBatches(dedupKeys, keys => api.moveItemsToTrash(keys), state => emit({
+        ...reply, action: "gptkProgress", itemsProcessed: state.acknowledgedKeys.length,
+        trashState: { ...state, trashedKeys: mediaAcknowledged(state.acknowledgedKeys.length) },
+      }), signal)
+      await emit({
+        ...reply, action: "gptkResult", success: batch.outcome === "complete", error: batch.error,
+        data: {
+          ...batch,
+          trashedCount: batch.acknowledgedKeys.length,
+          trashedKeys: mediaAcknowledged(batch.acknowledgedKeys.length),
+        },
+      })
+      return
+    }
+    for (let offset = 0; offset < dedupKeys.length; offset += TRASH_BATCH_SIZE) {
+      const batch = dedupKeys.slice(offset, offset + TRASH_BATCH_SIZE)
+      await api.restoreFromTrash(batch)
       const itemsProcessed = offset + batch.length
       await emit({
         ...reply, action: "gptkProgress", itemsProcessed,
-        message: isTrash
-          ? `Moved ${itemsProcessed} of ${dedupKeys.length} items to trash`
-          : `Restored ${itemsProcessed} of ${dedupKeys.length} items`,
+        message: `Restored ${itemsProcessed} of ${dedupKeys.length} items`,
       })
     }
     await emit({
-      ...reply, action: "gptkResult", success: true,
-      data: isTrash
-        ? { trashedCount: dedupKeys.length, trashedKeys: request.mediaKeysToTrash }
-        : { restoredCount: dedupKeys.length },
+      ...reply, action: "gptkResult", success: true, data: { restoredCount: dedupKeys.length },
     })
   } catch (failure) {
     if (signal.aborted) return

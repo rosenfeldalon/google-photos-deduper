@@ -19,7 +19,7 @@ export type PhotosCommand =
   | { command: "getAllMediaItems" }
   | { command: "healthCheck" }
   | { command: "getItemDetails"; mediaKeys: string[] }
-  | { command: "trashItems"; dedupKeys: string[]; mediaKeysToTrash: string[] }
+  | { command: "trashItems"; dedupKeys: string[]; mediaKeysToTrash: string[]; mediaKeysPerDedup?: number[] }
   | { command: "restoreItems"; dedupKeys: string[] }
 
 export interface IsolatedPhotosCommand extends GptkCommandMessage {
@@ -97,10 +97,18 @@ export function parsePhotosCommand(command: unknown, args: unknown): PhotosComma
       return dedupKeys ? { command, dedupKeys } : null
     }
     case "trashItems": {
-      if (keys.some(key => key !== "dedupKeys" && key !== "mediaKeysToTrash")) return null
+      if (keys.some(key => key !== "dedupKeys" && key !== "mediaKeysToTrash" && key !== "mediaKeysPerDedup")) return null
       const dedupKeys = parseKeys(options.dedupKeys)
       const mediaKeysToTrash = parseKeys(options.mediaKeysToTrash ?? [], true)
-      return dedupKeys && mediaKeysToTrash ? { command, dedupKeys, mediaKeysToTrash } : null
+      if (!dedupKeys || !mediaKeysToTrash || serializedSize(options) >= MAX_RESULT_BYTES / 2) return null
+      const mediaKeysPerDedup = options.mediaKeysPerDedup
+      if (mediaKeysPerDedup !== undefined) {
+        if (!Array.isArray(mediaKeysPerDedup) || mediaKeysPerDedup.length !== dedupKeys.length ||
+            !Array.from(mediaKeysPerDedup).every(count => Number.isSafeInteger(count) && count > 0) ||
+            mediaKeysPerDedup.reduce((total, count) => total + count, 0) !== mediaKeysToTrash.length) return null
+        return { command, dedupKeys, mediaKeysToTrash, mediaKeysPerDedup }
+      }
+      return { command, dedupKeys, mediaKeysToTrash }
     }
     default:
       return null

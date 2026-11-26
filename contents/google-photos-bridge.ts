@@ -23,7 +23,7 @@ async function deliver(reply: PhotosReply): Promise<void> {
   if (await chrome.runtime.sendMessage(reply) !== true) throw new Error("Photos response was not acknowledged.")
 }
 
-const detailsRequests = new Map<string, AbortController>()
+const activeRequests = new Map<string, { command: string; controller: AbortController }>()
 
 async function run(message: IsolatedPhotosCommand): Promise<void> {
   const { command, args, requestId } = message
@@ -37,15 +37,17 @@ async function run(message: IsolatedPhotosCommand): Promise<void> {
     return
   }
   const controller = new AbortController()
-  if (request.command === "getItemDetails") {
-    if (detailsRequests.size > 0) {
+  if (request.command === "getItemDetails" || request.command === "trashItems") {
+    if ([...activeRequests.values()].some(active => active.command === request.command)) {
       await deliver({
         app: APP_ID, action: "gptkResult", command, requestId, success: false,
-        error: "Album information is already loading in this Photos tab.",
+        error: request.command === "getItemDetails"
+          ? "Album information is already loading in this Photos tab."
+          : "Another trash operation is still active in this Photos tab.",
       })
       return
     }
-    detailsRequests.set(requestId, controller)
+    activeRequests.set(requestId, { command, controller })
   }
   try {
     await executePhotosCommand(request, requestId, session.path, createPhotosApi(session), reply => {
@@ -53,12 +55,12 @@ async function run(message: IsolatedPhotosCommand): Promise<void> {
       // app may already start the next page while Chrome acknowledges delivery.
       if (reply.action === "gptkResult" ||
           (reply.action === "gptkResultChunk" && reply.chunkIndex + 1 === reply.totalChunks)) {
-        detailsRequests.delete(requestId)
+        activeRequests.delete(requestId)
       }
       return deliver(reply)
     }, controller.signal)
   } finally {
-    detailsRequests.delete(requestId)
+    activeRequests.delete(requestId)
   }
 }
 
@@ -70,7 +72,9 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
   }
   if (!isInternalRequestId(message.requestId)) return
   if (message.action === "gptkCancel") {
-    detailsRequests.get(message.requestId)?.abort()
+    const active = activeRequests.get(message.requestId)
+    active?.controller.abort()
+    respond(active !== undefined)
     return
   }
   if (message.action !== "gptkCommand") return

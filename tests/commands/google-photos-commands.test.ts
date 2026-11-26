@@ -46,6 +46,7 @@ function findMediaItemsResult(
 
 /** Wait for all queued microtasks / promise continuations to settle. */
 async function flush() {
+  if (vi.isFakeTimers()) return vi.runAllTimersAsync()
   await new Promise((r) => setTimeout(r, 0))
 }
 
@@ -295,6 +296,9 @@ describe("getAllMediaItems — result chunking", () => {
 // ============================================================
 
 describe("trashItems — chunking", () => {
+  beforeEach(() => vi.useFakeTimers())
+  afterEach(() => vi.useRealTimers())
+
   it("sends a single API call when items fit in one batch (≤ 250)", async () => {
     const { messages, restore } = collectMessages()
     const dedupKeys = Array.from({ length: 200 }, (_, i) => `dk-${i}`)
@@ -346,7 +350,7 @@ describe("trashItems — chunking", () => {
   })
 
   it("reports error and stops on first API failure", async () => {
-    mockMoveItemsToTrash.mockRejectedValueOnce(new Error("HTTP 504"))
+    mockMoveItemsToTrash.mockRejectedValue(new Error("HTTP 504"))
 
     const { messages, restore } = collectMessages()
     const dedupKeys = Array.from({ length: 400 }, (_, i) => `dk-${i}`)
@@ -354,8 +358,9 @@ describe("trashItems — chunking", () => {
     sendCommand("trashItems", "req-4", { dedupKeys, mediaKeysToTrash: [] })
     await flush()
 
-    // Only called once — stops after the first failure
-    expect(mockMoveItemsToTrash).toHaveBeenCalledTimes(1)
+    // Four attempts on the same failed batch. No later batch is sent.
+    expect(mockMoveItemsToTrash).toHaveBeenCalledTimes(4)
+    expect(new Set(mockMoveItemsToTrash.mock.calls.map(([keys]) => JSON.stringify(keys))).size).toBe(1)
 
     const result = messages.find(
       (m: any) => m.action === "gptkResult" && m.command === "trashItems"
@@ -420,6 +425,9 @@ describe("restoreItems — chunking", () => {
 // ============================================================
 
 describe("integration: trashItems full flow", () => {
+  beforeEach(() => vi.useFakeTimers())
+  afterEach(() => vi.useRealTimers())
+
   it("chunks 1100 items into 5 batches, reports progress, and returns correct result", async () => {
     const { messages, restore } = collectMessages()
 
