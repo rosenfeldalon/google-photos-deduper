@@ -21,11 +21,14 @@ Build this fork using the [setup instructions](#setup) below. To install a publi
 
 ## Usage
 
+**Scan only for now.** Live trash requires a build from `fork/main` after the authenticated bridge, album details, and ownership safeguards have been merged and their review recorded.
+
 1. Open Google Photos in Chrome with the extension installed
 2. Click the extension icon → **Open Deduper**
 3. Click **Scan Library** to fetch your media items and find visually identical photos using local MediaPipe image embeddings
-4. Review the duplicate groups and album details. You can stop here for a scan without changes to your library
-5. To move selected copies to Trash, choose **Move to Trash** and review the confirmation
+4. Review the duplicate groups, album details, and ownership summary
+
+For the first live trash after the project clears the gate, choose two or three groups, review the **Move to Trash** confirmation, and verify that the copies are restorable in Google Photos Trash. Leave Trash intact for 30 days.
 
 Album and ownership details load for photos in duplicate groups. Confirm the suggested Photos owner before selecting copies for trash. Partner, shared and unverified copies stay protected. Photos you own in a shared album require individual selection. Older scans without an associated account stay viewable and require a new scan before trash is available.
 
@@ -39,7 +42,7 @@ The extension uses your signed-in Google Photos tab. There is no OAuth or Google
 
 Use Chrome 106 or later and Node.js 22. If you use nvm, run `nvm install` and `nvm use` from the repository root to select the version in `.nvmrc`.
 
-For a new checkout, clone the fork's runbook branch. For an existing checkout of that branch or its merged changes, start in the repository root.
+For a new development or mocked-test checkout, clone the fork's runbook branch. For an existing checkout, start in the repository root.
 
 ```bash
 git clone --branch docs/fork-runbook https://github.com/rosenfeldalon/google-photos-deduper.git
@@ -52,7 +55,9 @@ npm ci
 npm run build
 ```
 
-In Chrome, open `chrome://extensions`, enable **Developer mode**, and select **Load unpacked**. Choose `build/chrome-mv3-prod/` in this checkout. After rebuilding, click **Reload** on the extension card, then refresh your Google Photos tab and reopen the deduper from the toolbar.
+Use the same setup commands on `fork/main` once it contains the merged changes to build for a live Google Photos session. In Chrome, open `chrome://extensions`, enable **Developer mode**, and select **Load unpacked**. Choose `build/chrome-mv3-prod/` from the `fork/main` checkout. Use a separate Chrome profile for Photos or disable other extensions during the check.
+
+After rebuilding, click **Reload** on the extension card, then refresh your Google Photos tab and reopen the deduper from the toolbar. For the first live bridge check, confirm that `typeof window.gptkApi` and `typeof window.gptkApiUtils` both return `"undefined"` in the Photos tab's DevTools console, then verify that a read-only scan works.
 
 ### Development commands
 
@@ -91,7 +96,7 @@ If tests time out while running in parallel, run them with one worker using `npm
 
 ### Live Google Photos tests
 
-The full E2E suite can move photos to Trash and attempt to undo the move. Run it only against a disposable Google Photos test account containing expendable copies. It connects to a running Chrome instance via the [Chrome DevTools Protocol (CDP)](https://chromedevtools.github.io/devtools-protocol/). Start a dedicated Chrome profile with remote debugging.
+The full E2E suite can move photos to Trash and attempt to undo the move. Wait for the live trash gate above and use a disposable Google Photos test account containing expendable copies. The suite connects to a running Chrome instance via the [Chrome DevTools Protocol (CDP)](https://chromedevtools.github.io/devtools-protocol/). Start a dedicated Chrome profile with remote debugging.
 
 **macOS:**
 ```bash
