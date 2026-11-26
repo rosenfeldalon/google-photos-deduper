@@ -37,6 +37,15 @@ describe("Photos bridge protocol", () => {
     })
   })
 
+  it("validates a trash command's optional media association", () => {
+    const args = { dedupKeys: ["dedup"], mediaKeysToTrash: ["a", "b"] }
+    expect(parsePhotosCommand("trashItems", { ...args, mediaKeysPerDedup: [2] })).toMatchObject({
+      mediaKeysPerDedup: [2],
+    })
+    expect(parsePhotosCommand("trashItems", { ...args, mediaKeysPerDedup: [1] })).toBeNull()
+    expect(parsePhotosCommand("trashItems", { ...args, mediaKeysPerDedup: [0, 2] })).toBeNull()
+  })
+
   it("rejects unknown commands and health check arguments", () => {
     expect(parsePhotosCommand("unknown", undefined)).toBeNull()
     expect(parsePhotosCommand("healthCheck", { unexpected: 1 })).toBeNull()

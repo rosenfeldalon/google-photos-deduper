@@ -432,3 +432,35 @@ describe("SCAN_PROGRESS fetch position", () => {
     expect((next as { oldestTakenAt?: number }).oldestTakenAt).toBeUndefined()
   })
 })
+
+describe("paused trash operations", () => {
+  const active = {
+    status: "trashing" as const, mediaItems, groups, totalItems: 4, totalToTrash: 3, trashedSoFar: 1,
+    accountEmail: "fixture@example.test",
+  }
+
+  it("preserves the scan when the watchdog pauses and resumes without losing the count", () => {
+    const paused = appReducer(active, {
+      type: "TRASH_PAUSED", message: "No batch acknowledgement", waiting: true, uncertain: true,
+    })
+    expect(paused).toMatchObject({
+      status: "trash-paused", mediaItems, groups, totalToTrash: 3, trashedSoFar: 1, waiting: true,
+    })
+    expect(appReducer(paused, { type: "TRASH_RESUMED" })).toBe(paused)
+    const ready = appReducer(paused, { type: "TRASH_PAUSED", message: "Stopped", waiting: false, uncertain: true })
+    expect(appReducer(ready, { type: "TRASH_RESUMED" })).toMatchObject({
+      status: "trashing", mediaItems, groups, trashedSoFar: 1,
+    })
+  })
+
+  it("removes only acknowledged photos when stopping a partial move and allows snapshot restoration", () => {
+    const paused = appReducer(active, { type: "TRASH_PAUSED", message: "Stopped", waiting: false, uncertain: false })
+    const key = Object.keys(mediaItems)[0]
+    const done = appReducer(paused, { type: "TRASH_COMPLETE", trashedKeys: [key] })
+    expect(done.status).toBe("results")
+    if (done.status !== "results") return
+    expect(Object.keys(done.mediaItems)).not.toContain(key)
+    const undo = appReducer(done, { type: "RESTORE_SNAPSHOT", mediaItems, groups, totalItems: 4 })
+    expect(undo).toMatchObject({ status: "results", mediaItems, groups, accountEmail: "fixture@example.test" })
+  })
+})

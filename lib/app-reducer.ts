@@ -14,6 +14,17 @@ import { areScanResultsValid } from "./scan-results"
 // Types
 // ============================================================
 
+interface TrashRunState {
+  mediaItems: Record<string, GpdMediaItem>
+  groups: DuplicateGroup[]
+  totalItems: number
+  totalToTrash: number
+  trashedSoFar: number
+  bucketsSplit?: number
+  accountEmail?: string
+  retrying?: string
+}
+
 export type AppState =
   | { status: "connecting" }
   | { status: "connected"; hasGptk: boolean; accountEmail?: string }
@@ -42,16 +53,13 @@ export type AppState =
       bucketsSplit?: number
       accountEmail?: string
     }
-  | {
-      status: "trashing"
-      mediaItems: Record<string, GpdMediaItem>
-      groups: DuplicateGroup[]
-      totalItems: number
-      totalToTrash: number
-      trashedSoFar: number
-      bucketsSplit?: number
-      accountEmail?: string
-    }
+  | ({ status: "trashing" } & TrashRunState)
+  | ({
+      status: "trash-paused"
+      message: string
+      waiting: boolean
+      uncertain: boolean
+    } & TrashRunState)
 
 export type AppAction =
   | { type: "HEALTH_CHECK_RESULT"; payload: HealthCheckResultMessage }
@@ -73,7 +81,9 @@ export type AppAction =
       groups: DuplicateGroup[]
       totalItems: number
     }
-  | { type: "TRASH_PROGRESS"; trashedSoFar: number }
+  | { type: "TRASH_PROGRESS"; trashedSoFar: number; retrying?: string }
+  | { type: "TRASH_PAUSED"; message: string; waiting: boolean; uncertain: boolean }
+  | { type: "TRASH_RESUMED" }
   | { type: "TRASH_COMPLETE"; trashedKeys: string[] }
   | { type: "TRASH_ERROR"; error: string }
   | {
@@ -100,6 +110,7 @@ export type AppAction =
 export function appReducer(state: AppState, action: AppAction): AppState {
   switch (action.type) {
     case "HEALTH_CHECK_RESULT":
+      if (state.status === "trashing" || state.status === "trash-paused") return state
       if (action.payload.success) {
         // Don't downgrade from results — just confirm GP is still available
         if (state.status === "results") {
@@ -194,11 +205,21 @@ export function appReducer(state: AppState, action: AppAction): AppState {
       }
 
     case "TRASH_PROGRESS":
-      if (state.status !== "trashing") return state
-      return { ...state, trashedSoFar: action.trashedSoFar }
+      if (state.status !== "trashing" && state.status !== "trash-paused") return state
+      return { ...state, trashedSoFar: action.trashedSoFar, retrying: action.retrying }
+
+    case "TRASH_PAUSED":
+      if (state.status !== "trashing" && state.status !== "trash-paused") return state
+      return {
+        ...state, status: "trash-paused", message: action.message, waiting: action.waiting, uncertain: action.uncertain,
+      }
+
+    case "TRASH_RESUMED":
+      if (state.status !== "trash-paused" || state.waiting) return state
+      return { ...state, status: "trashing", retrying: undefined }
 
     case "TRASH_COMPLETE": {
-      if (state.status !== "trashing") return state
+      if (state.status !== "trashing" && state.status !== "trash-paused") return state
       const trashedSet = new Set(action.trashedKeys)
       const newGroups = state.groups
         .map((g) => ({
@@ -246,6 +267,7 @@ export function appReducer(state: AppState, action: AppAction): AppState {
       }
 
     case "GP_TAB_CLOSED":
+      if (state.status === "trashing" || state.status === "trash-paused") return state
       return {
         status: "disconnected",
         error: "Google Photos tab was closed. Please reopen photos.google.com and retry.",

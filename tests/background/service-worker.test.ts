@@ -265,4 +265,24 @@ describe("Photos service worker", () => {
     await started
     expect(chromeMock.tabs.sendMessage.mock.calls.some(([, message]) => message.action === "gptkCommand")).toBe(false)
   })
+
+  it("acknowledges a trash cancellation and still relays the terminal partial reply", async () => {
+    await healthCheck()
+    await send({ action: "gptkCommand", command: "trashItems", requestId: "move",
+      accountEmail: session.account, args: { dedupKeys: ["item"] } })
+    const internal = chromeMock.tabs.sendMessage.mock.calls.find(([, m]) =>
+      m.action === "gptkCommand"
+    )?.[1].requestId
+    chromeMock.tabs.sendMessage.mockResolvedValueOnce(true)
+    expect(await send({ action: "gptkCancel", requestId: "move" })).toBe(true)
+    expect(chromeMock.tabs.sendMessage).toHaveBeenLastCalledWith(
+      10, { app: APP_ID, action: "gptkCancel", requestId: internal }, photosTarget
+    )
+    const data = { outcome: "stopped", acknowledgedKeys: [], remainingKeys: ["item"], failedBatchIndex: 0, uncertain: true }
+    await send({ action: "gptkResult", command: "trashItems", requestId: internal, success: false, data }, bridge)
+    expect(chromeMock.tabs.sendMessage).toHaveBeenLastCalledWith(
+      20, expect.objectContaining({ requestId: "move", data }), appTarget
+    )
+    expect(await send({ action: "gptkCancel", requestId: "not-active" })).toBe(false)
+  })
 })
