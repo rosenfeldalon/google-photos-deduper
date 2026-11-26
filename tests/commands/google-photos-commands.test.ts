@@ -1,69 +1,25 @@
-/**
- * Tests for scripts/google-photos-commands.js
- *
- * The commands script runs in a MAIN world context — it registers a
- * window "message" listener on import and uses window.postMessage to
- * communicate results back to the bridge. Tests drive it by dispatching
- * MessageEvents and inspecting postMessage calls.
- *
- * @vitest-environment happy-dom
- */
-import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from "vitest"
-
-// ============================================================
-// Globals the script expects at runtime
-// ============================================================
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest"
+import { executePhotosCommand, type PhotosApi } from "../../lib/photos-commands"
+import { parsePhotosCommand, type PhotosReply } from "../../lib/photos-protocol"
 
 const mockMoveItemsToTrash = vi.fn()
 const mockRestoreFromTrash = vi.fn()
+let scanApi: Partial<PhotosApi> & { getItemsByUploadedDate?: unknown } = {}
+let delivered: PhotosReply[] = []
 
-const mockApi = {
-  moveItemsToTrash: mockMoveItemsToTrash,
-  restoreFromTrash: mockRestoreFromTrash,
-}
-
-// Set up window globals BEFORE importing the module so the script
-// sees them when it first executes.
-Object.defineProperty(window, "gptkApiUtils", {
-  value: { api: mockApi },
-  writable: true,
-  configurable: true,
-})
-
-// ============================================================
-// Import the commands script (registers listener on window)
-// ============================================================
-
-beforeAll(async () => {
-  // google-photos-commands.js is a side-effect-only MAIN world script (no exports).
-  // We import it here purely to register its window "message" listener.
-  // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-  // @ts-ignore
-  await import("../../scripts/google-photos-commands.js")
-})
-
-// ============================================================
-// Helpers
-// ============================================================
-
-/** Dispatch a gptkCommand message the same way the bridge does. */
 function sendCommand(command: string, requestId: string, args: unknown) {
-  window.dispatchEvent(
-    new MessageEvent("message", {
-      source: window,
-      data: { app: "GPD", action: "gptkCommand", command, requestId, args },
-    })
-  )
+  const validated = parsePhotosCommand(command, args)
+  if (!validated) throw new Error("Invalid test command")
+  void executePhotosCommand(validated, requestId, window.location.pathname.match(/^\/u\/\d+\//)?.[0] ?? "/", {
+    getItemsByTakenDate: scanApi.getItemsByTakenDate ?? vi.fn(),
+    moveItemsToTrash: mockMoveItemsToTrash,
+    restoreFromTrash: mockRestoreFromTrash,
+  }, (message) => { delivered.push(message) })
 }
 
-/** Collect window.postMessage calls during an async operation. */
-function collectMessages(): { messages: unknown[]; restore: () => void } {
-  const messages: unknown[] = []
-  const original = window.postMessage.bind(window)
-  const spy = vi.spyOn(window, "postMessage").mockImplementation((msg) => {
-    messages.push(msg)
-  })
-  return { messages, restore: () => spy.mockRestore() }
+function collectMessages() {
+  delivered = []
+  return { messages: delivered, restore: () => { delivered = [] } }
 }
 
 /**
@@ -113,13 +69,13 @@ afterEach(() => {
 
 describe("getAllMediaItems — field mapping", () => {
   function setupGptkApi(items: unknown[], nextPageId: string | null = null) {
-    ;(window as any).gptkApi = {
+    scanApi = {
       getItemsByTakenDate: vi.fn().mockResolvedValue({ items, nextPageId }),
     }
   }
 
   afterEach(() => {
-    delete (window as any).gptkApi
+    scanApi = {}
     window.history.pushState({}, "", "/")
   })
 
@@ -240,7 +196,7 @@ describe("getAllMediaItems — result chunking", () => {
   /** Serve `total` synthetic items across pages of `pageSize`. */
   function setupLibrary(total: number, pageSize = 5000) {
     let served = 0
-    ;(window as any).gptkApi = {
+    scanApi = {
       getItemsByTakenDate: vi.fn().mockImplementation(async () => {
         const n = Math.min(pageSize, total - served)
         const items = Array.from({ length: n }, (_, i) => ({
@@ -257,7 +213,7 @@ describe("getAllMediaItems — result chunking", () => {
   }
 
   afterEach(() => {
-    delete (window as any).gptkApi
+    scanApi = {}
   })
 
   function chunksFrom(messages: unknown[]) {
@@ -522,13 +478,13 @@ describe("getAllMediaItems — page timeout", () => {
 
   afterEach(() => {
     vi.useRealTimers()
-    delete (window as any).gptkApi
+    scanApi = {}
   })
 
   it("surfaces a timeout error when a page fetch never resolves", async () => {
-    ;(window as any).gptkApi = {
+    scanApi = {
       // Never resolves — simulates Google's pagination endpoint hanging.
-      getItemsByTakenDate: vi.fn(() => new Promise(() => {})),
+      getItemsByTakenDate: vi.fn(() => new Promise<never>(() => {})),
     }
 
     const { messages, restore } = collectMessages()
@@ -546,7 +502,7 @@ describe("getAllMediaItems — page timeout", () => {
   })
 
   it("does not error when the page resolves before the timeout fires", async () => {
-    ;(window as any).gptkApi = {
+    scanApi = {
       getItemsByTakenDate: vi
         .fn()
         .mockResolvedValue({ items: [], nextPageId: null }),
@@ -573,13 +529,13 @@ describe("getAllMediaItems — page timeout", () => {
 
 describe("getAllMediaItems — fetch position", () => {
   function setupGptkApi(items: unknown[], nextPageId: string | null = null) {
-    ;(window as any).gptkApi = {
+    scanApi = {
       getItemsByTakenDate: vi.fn().mockResolvedValue({ items, nextPageId }),
     }
   }
 
   afterEach(() => {
-    delete (window as any).gptkApi
+    scanApi = {}
     window.history.pushState({}, "", "/")
   })
 
@@ -642,13 +598,13 @@ describe("getAllMediaItems — fetch position", () => {
 
 describe("getAllMediaItems — favorite flag", () => {
   function setupGptkApi(items: unknown[], nextPageId: string | null = null) {
-    ;(window as any).gptkApi = {
+    scanApi = {
       getItemsByTakenDate: vi.fn().mockResolvedValue({ items, nextPageId }),
     }
   }
 
   afterEach(() => {
-    delete (window as any).gptkApi
+    scanApi = {}
     window.history.pushState({}, "", "/")
   })
 
@@ -693,7 +649,7 @@ describe("getAllMediaItems — favorite flag", () => {
 
 describe("getAllMediaItems — listing source", () => {
   afterEach(() => {
-    delete (window as any).gptkApi
+    scanApi = {}
   })
 
   it("pages through getItemsByTakenDate and never calls the upload-date listing", async () => {
@@ -708,7 +664,7 @@ describe("getAllMediaItems — listing source", () => {
         nextPageId: null,
       })
     const uploaded = vi.fn()
-    ;(window as any).gptkApi = {
+    scanApi = {
       getItemsByTakenDate: takenDate,
       getItemsByUploadedDate: uploaded,
     }
@@ -729,7 +685,7 @@ describe("getAllMediaItems — listing source", () => {
   // The old upload-date path stopped at a cache watermark. A full fetch must
   // return every item, or items absent from the result would look deleted.
   it("ignores a stale sinceTimestamp and returns the whole library", async () => {
-    ;(window as any).gptkApi = {
+    scanApi = {
       getItemsByTakenDate: vi.fn().mockResolvedValue({
         items: [{ mediaKey: "old", dedupKey: "do", timestamp: 1, creationTimestamp: 1 }],
         nextPageId: null,

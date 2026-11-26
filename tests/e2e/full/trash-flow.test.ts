@@ -1,6 +1,6 @@
 /**
  * Full E2E: trash flow against real Google Photos library.
- * Trashes all selected duplicates then immediately undoes — safe for any account.
+ * Requires an approved test library. Trashes selected duplicates, then attempts undo.
  *
  * Prerequisites:
  *   1. `npm run build`
@@ -27,9 +27,6 @@ test("trashes duplicates via API and undoes via undo snackbar", async () => {
     // Open GP tab
     await gpPage.goto("https://photos.google.com")
     await gpPage.waitForLoadState("networkidle")
-    await gpPage.waitForFunction(() => typeof window.gptkApi !== "undefined", {
-      timeout: 15_000,
-    })
 
     await appPage.goto(`chrome-extension://${extensionId}/tabs/app.html`)
 

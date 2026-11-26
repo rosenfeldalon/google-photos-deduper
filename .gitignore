@@ -8,7 +8,7 @@ build/
 tsconfig.tsbuildinfo
 
 # Scripts generated at build time
-scripts/google-photos-toolkit.user.js
+scripts/photos-api.generated.mjs
 scripts/vision_wasm_internal.*
 
 # Logs

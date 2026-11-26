@@ -32,7 +32,7 @@ No OAuth setup. No Google Cloud project. No data leaves your browser.
 
 ### Setup
 
-**Prerequisites:** Google Chrome, Node.js 22
+**Prerequisites:** Chrome 106 or later, Node.js 22
 
 ```bash
 git clone https://github.com/mtalcott/google-photos-deduper.git
@@ -59,6 +59,8 @@ npm test
 # Run full E2E tests (requires Chrome with remote debugging — see below)
 npm run test:e2e
 ```
+
+See [Photos bridge security](docs/bridge-security.md) for the command and session boundary.
 
 ### Full E2E Tests
 

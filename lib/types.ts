@@ -187,7 +187,7 @@ export interface GpdMediaItem {
   creationTimestamp: number; // upload date
   resWidth?: number;
   resHeight?: number;
-  fileName?: string;
+  fileName?: string | null;
   size?: number;
   isOwned?: boolean;
   isOriginalQuality?: boolean | null;

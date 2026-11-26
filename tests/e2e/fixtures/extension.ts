@@ -89,14 +89,19 @@ export async function launchExtension(): Promise<{
   extensionId: string
 }> {
   const context = await chromium.launchPersistentContext("", {
-    headless: false,
+    headless: Boolean(process.env.GPD_TEST_CHROMIUM),
+    executablePath: process.env.GPD_TEST_CHROMIUM || undefined,
     args: [
+      "--disable-background-networking",
+      "--no-proxy-server",
+      "--host-resolver-rules=MAP * ~NOTFOUND",
       `--disable-extensions-except=${extensionPath}`,
       `--load-extension=${extensionPath}`,
       "--no-sandbox",
     ],
   })
 
+  await context.route(/^https?:\/\//, route => route.abort("blockedbyclient"))
   let sw = context.serviceWorkers()[0]
   if (!sw) sw = await context.waitForEvent("serviceworker")
   const extensionId = new URL(sw.url()).hostname
@@ -185,54 +190,64 @@ export async function injectGpAuth(context: BrowserContext): Promise<void> {
 // GPTK stub helpers (integration tests)
 // ============================================================
 
-const gptkStubHtml = fs.readFileSync(
-  path.resolve(__dirname, "gptk-stub.html"),
-  "utf-8"
-)
-
-/**
- * Per-command response overrides for the GPTK stub.
- * Set `success: false` to force a command to fail.
- */
-export interface GptkOverrides {
+interface GptkOverrides {
+  healthCheck?: { data: { accountEmail: string } }
+  getAllMediaItems?: { itemCount: number }
   trashItems?: { success: false; error: string }
   restoreItems?: { success: false; error: string }
-  [command: string]: { success: false; error: string } | { data: unknown } | undefined
 }
 
-/**
- * Intercept https://photos.google.com/* and serve the GPTK stub page.
- * The extension's bridge content script is injected automatically because the
- * intercepted URL matches the content script's "matches" pattern.
- *
- * Call this before opening the stub page. Returns the opened stub Page so tests
- * can close it, inspect state, or inject overrides via page.evaluate().
- *
- * @param overrides  Per-command response overrides (e.g. force trashItems to fail)
- */
+/** Serve synthetic Photos HTML and replies for the pinned toolkit's API parser. */
 export async function openGptkStubPage(
   context: BrowserContext,
   overrides: GptkOverrides = {}
 ): Promise<Page> {
-  // Intercept ALL requests to photos.google.com so the content script host loads
-  await context.route("https://photos.google.com/**", async (route) => {
-    await route.fulfill({
-      status: 200,
-      contentType: "text/html",
-      body: gptkStubHtml,
-    })
-  })
-
-  const page = await context.newPage()
-  await page.goto("https://photos.google.com/")
-
-  // Inject overrides so the stub responds as configured
-  if (Object.keys(overrides).length > 0) {
-    await page.evaluate((ov) => {
-      ;(window as unknown as { __gptkOverrides: GptkOverrides }).__gptkOverrides = ov
-    }, overrides)
+  const account = overrides.healthCheck?.data.accountEmail ?? "test@example.com"
+  const wiz = {
+    oPEP7c: account, FdrFJe: "100", cfb2h: "fixture-version",
+    eptZe: "/", SNlM0e: "fixture-only",
   }
+  const page = await context.newPage()
+  await page.route("https://photos.google.com/**", async route => {
+    const request = route.request()
+    const url = new URL(request.url())
+    if (url.pathname !== "/data/batchexecute") {
+      await route.fulfill({
+        contentType: "text/html",
+        body: `<!doctype html><title>Photos fixture</title>
+          <script>window.WIZ_global_data = ${JSON.stringify(wiz)}</script>`,
+      })
+      return
+    }
 
+    const rpc = url.searchParams.get("rpcids")
+    const form = new URLSearchParams(request.postData() ?? "")
+    const requestData = JSON.parse(JSON.parse(form.get("f.req") ?? "[]")[0][0][1])
+    let payload: unknown
+    if (rpc === "lcxiM") {
+      const count = overrides.getAllMediaItems?.itemCount ?? 0
+      const cursor = Number(requestData[0] ?? 0)
+      const end = Math.min(count, cursor + 500)
+      const items = Array.from({ length: end - cursor }, (_, i) => {
+        const n = cursor + i
+        const timestamp = 1_600_000_000_000 - n
+        return [`mk${n}`, ["https://fixture.invalid/thumb", 100, 100], timestamp, `dk${n}`, 0, timestamp, null, []]
+      })
+      payload = [items, end < count ? String(end) : null, null]
+    } else if (rpc === "XwAOJf") {
+      const failure = requestData[1] === 1 ? overrides.trashItems : overrides.restoreItems
+      if (failure) {
+        await route.fulfill({ status: Number(/HTTP (\d{3})/.exec(failure.error)?.[1]) || 500 })
+        return
+      }
+      payload = [true]
+    } else {
+      await route.fulfill({ status: 400 })
+      return
+    }
+    await route.fulfill({ json: [["wrb.fr", rpc, JSON.stringify(payload)]] })
+  })
+  await page.goto("https://photos.google.com/")
   return page
 }
 

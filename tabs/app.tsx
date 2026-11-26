@@ -32,6 +32,7 @@ import {
 } from "../lib/duplicate-detector"
 import type { DetectionProgress } from "../lib/duplicate-detector"
 import { selectDefaultKeep } from "../lib/duplicate-detector"
+import { createRequestId } from "../lib/photos-protocol"
 import { ScanLogger } from "../lib/scan-log"
 import theme from "../lib/theme"
 import { APP_ID, DEFAULT_SETTINGS } from "../lib/types"
@@ -68,10 +69,6 @@ const HEALTH_CHECK_MAX_ATTEMPTS = 5
 // the app waits forever and the scan looks frozen mid-count.
 const FETCH_WATCHDOG_MS = 150_000
 
-function generateRequestId(): string {
-  return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-}
-
 function sendToServiceWorker(message: AppMessage): void {
   chrome.runtime.sendMessage(message)
 }
@@ -83,6 +80,7 @@ function sendToServiceWorker(message: AppMessage): void {
 export default function App() {
   const [state, dispatch] = useReducer(appReducer, { status: "connecting" })
   const [storageChecked, setStorageChecked] = useState(false)
+  const [photosConnected, setPhotosConnected] = useState(false)
   const [settings, setSettings] = useReducer(
     (prev: ScanSettings, next: Partial<ScanSettings>) => ({ ...prev, ...next }),
     DEFAULT_SETTINGS
@@ -245,16 +243,13 @@ export default function App() {
 
     const listener = (message: AppMessage, sender: chrome.runtime.MessageSender) => {
       if (message?.app !== APP_ID) return
-      // The bridge content script sends GPTK results via chrome.runtime.sendMessage,
-      // which broadcasts to ALL extension contexts — so this listener fires twice:
-      // once directly from the bridge (sender.tab set) and once via the service
-      // worker relay (no sender.tab). Ignore direct bridge deliveries to avoid
-      // processing each result twice.
-      if (sender.tab) return
+      // runtime.sendMessage also reaches extension pages directly from content scripts.
+      if (sender.id !== chrome.runtime.id || sender.tab !== undefined) return
 
       switch (message.action) {
         case "healthCheck.result": {
           const msg = message as HealthCheckResultMessage
+          setPhotosConnected(msg.success && msg.hasGptk)
           // Swallow early "failed" results and retry — when the app tab opens
           // before the bridge content script has fully loaded on a fresh
           // photos.google.com tab, or when the service worker has just woken
@@ -366,6 +361,7 @@ export default function App() {
         }
         case "gptkLog":
           if ((message as { level?: string }).level === "error") {
+            setPhotosConnected(false)
             dispatch({ type: "GP_TAB_CLOSED" })
           }
           break
@@ -374,11 +370,12 @@ export default function App() {
           // Any fetch progress means the GP tab is still alive — reset the
           // silence timer.
           if (
-            progress.command === undefined &&
-            currentScanRequestIdRef.current !== null
+            progress.command === "getAllMediaItems" &&
+            progress.requestId === currentScanRequestIdRef.current
           ) {
             armFetchWatchdog()
           }
+          if (progress.command === "getAllMediaItems" && progress.requestId !== currentScanRequestIdRef.current) break
           if (progress.command === "trashItems") {
             console.log(`[GPD] trash progress: ${progress.itemsProcessed}`)
             dispatch({ type: "TRASH_PROGRESS", trashedSoFar: progress.itemsProcessed })
@@ -634,7 +631,7 @@ export default function App() {
     scanAbortRef.current?.abort()
     scanAbortRef.current = new AbortController()
 
-    const requestId = generateRequestId()
+    const requestId = createRequestId()
     currentScanRequestIdRef.current = requestId
     // Drop any partially reassembled result from a previous scan
     resultChunksRef.current = {}
@@ -690,11 +687,11 @@ export default function App() {
   }, [state, selectedGroupIds, getKept])
 
   const handleTrashConfirmed = useCallback(() => {
-    if (!trashConfirm || state.status !== "results") return
+    if (!photosConnected || !trashConfirm || state.status !== "results") return
     const { dedupKeys, mediaKeysToTrash } = trashConfirm
     setTrashConfirm(null)
 
-    const requestId = generateRequestId()
+    const requestId = createRequestId()
 
     // Capture snapshot for undo
     preTrashSnapshotRef.current = {
@@ -719,7 +716,7 @@ export default function App() {
       requestId,
       args: { dedupKeys, mediaKeysToTrash }
     })
-  }, [trashConfirm, state])
+  }, [photosConnected, trashConfirm, state])
 
   const handleCancelScan = useCallback(() => {
     scanAbortRef.current?.abort()
@@ -734,6 +731,7 @@ export default function App() {
     currentScanRequestIdRef.current = null
     resultChunksRef.current = {}
     dispatch({ type: "RESET" })
+    setPhotosConnected(false)
     healthCheckAttemptsRef.current = 0
     sendToServiceWorker({ app: APP_ID, action: "healthCheck" })
   }, [clearFetchWatchdog])
@@ -752,7 +750,7 @@ export default function App() {
       app: APP_ID,
       action: "gptkCommand",
       command: "restoreItems",
-      requestId: generateRequestId(),
+      requestId: createRequestId(),
       args: { dedupKeys: undoData.dedupKeys }
     })
     setUndoData(null)
@@ -884,6 +882,7 @@ export default function App() {
               totalItems={state.totalItems}
               groupCount={groups.length}
               duplicateCount={duplicateCount}
+              trashDisabled={!photosConnected}
               onSelectAll={handleSelectAll}
               onDeselectAll={handleDeselectAll}
               onTrash={handleTrash}
@@ -944,6 +943,7 @@ export default function App() {
           <Button onClick={() => setTrashConfirm(null)}>Cancel</Button>
           <Button
             onClick={handleTrashConfirmed}
+            disabled={!photosConnected}
             variant="contained"
             color="error">
             Move to Trash

@@ -12,6 +12,7 @@ interface ActionBarProps {
   totalItems: number
   groupCount: number
   duplicateCount: number
+  trashDisabled?: boolean
   onSelectAll: () => void
   onDeselectAll: () => void
   onTrash: () => void
@@ -22,6 +23,7 @@ export function ActionBar({
   totalItems,
   groupCount,
   duplicateCount,
+  trashDisabled = false,
   onSelectAll,
   onDeselectAll,
   onTrash,
@@ -81,7 +83,7 @@ export function ActionBar({
             color="error"
             size="small"
             startIcon={<DeleteOutlineRoundedIcon />}
-            disabled={duplicateCount === 0}
+            disabled={trashDisabled || duplicateCount === 0}
             onClick={onTrash}>
             Move {duplicateCount} Duplicate{duplicateCount !== 1 ? "s" : ""} to Trash
           </Button>
