@@ -7,7 +7,6 @@
   ],
   "include": [
     ".plasmo/index.d.ts",
-    "window.d.ts",
     "./**/*.ts",
     "./**/*.tsx"
   ],

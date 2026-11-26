@@ -30,11 +30,6 @@ test("connects to Google Photos and completes a scan", async () => {
     await gpPage.goto("https://photos.google.com")
     await gpPage.waitForLoadState("networkidle")
 
-    // Wait for GPTK to inject
-    await gpPage.waitForFunction(() => typeof window.gptkApi !== "undefined", {
-      timeout: 15_000,
-    })
-
     // Open the app tab
     await appPage.goto(`chrome-extension://${extensionId}/tabs/app.html`)
 
