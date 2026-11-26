@@ -1,11 +1,17 @@
-import type Api from "../Google-Photos-Toolkit/src/api/api"
+import type { ItemInfoExt, LibraryTimelinePage } from "../Google-Photos-Toolkit/src/types"
 import { loadPhotoDetails, PHOTO_DETAILS_BATCH_SIZE } from "./photo-details"
 import { MAX_RESULT_BYTES, PHOTOS_ORIGIN, serializedSize } from "./photos-protocol"
 import type { PhotosCommand, PhotosReply } from "./photos-protocol"
 import { runTrashBatches, TRASH_BATCH_SIZE } from "./trash-batches"
 import { APP_ID, type GpdMediaItem } from "./types"
 
-export type PhotosApi = Pick<Api, "getItemsByTakenDate" | "getItemInfoExt" | "moveItemsToTrash" | "restoreFromTrash">
+export interface PhotosApi {
+  getItemsByTakenDate(timestamp: number | null, source: string | null, pageId: string | null): Promise<LibraryTimelinePage>
+  getItemInfoExt(mediaKey: string): Promise<ItemInfoExt>
+  moveItemsToTrash(dedupKeys: string[]): Promise<unknown>
+  restoreFromTrash(dedupKeys: string[]): Promise<unknown>
+}
+
 type Emit = (reply: PhotosReply) => void | Promise<void>
 
 const RESULT_CHUNK_SIZE = 10_000
