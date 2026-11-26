@@ -50,7 +50,8 @@ async function run(message: IsolatedPhotosCommand): Promise<void> {
     activeRequests.set(requestId, { command, controller })
   }
   try {
-    await executePhotosCommand(request, requestId, session.path, createPhotosApi(session), reply => {
+    const libraryPath = session.path.replace(/_\/PhotosUi\/$/i, "")
+    await executePhotosCommand(request, requestId, libraryPath, createPhotosApi(session), reply => {
       // No detail RPCs remain after the final reply has been constructed. The
       // app may already start the next page while Chrome acknowledges delivery.
       if (reply.action === "gptkResult" ||

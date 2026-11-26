@@ -18,6 +18,15 @@ describe("Photos bridge protocol", () => {
     expect(parsePhotosSession({ ...session, bl: "x".repeat(16385) })).toBeNull()
   })
 
+  it.each(["/_/PhotosUi/", "/u/1/_/PhotosUi/"])("accepts the Photos UI RPC prefix %s", path => {
+    expect(parsePhotosSession({ ...session, path })).toEqual({ ...session, path })
+  })
+
+  it.each(["//example.test/", "/_/OtherUi/", "/_/PhotosUi/../", "/%2f_/PhotosUi/", "/_/PhotosUi/?query"])(
+    "rejects an unexpected RPC prefix %s",
+    path => expect(parsePhotosSession({ ...session, path })).toBeNull()
+  )
+
   it("preserves the existing closed scan options", () => {
     expect(parsePhotosCommand("getAllMediaItems", { dateRange: { from: "2020-02-01" } }))
       .toEqual({ command: "getAllMediaItems" })

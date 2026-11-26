@@ -6,6 +6,7 @@ const MAX_KEYS = 10_000
 export const MAX_DETAIL_KEYS = 100
 const MAX_KEY_LENGTH = 1024
 const MAX_SESSION_FIELD_LENGTH = 16_384
+const PHOTOS_RPC_PATH = /^\/(?:u\/\d{1,8}\/)?(?:_\/PhotosUi\/)?$/i
 
 export interface PhotosSession {
   account: string
@@ -44,7 +45,7 @@ export function parsePhotosSession(value: unknown): PhotosSession | null {
     !isBoundedString(sid, MAX_SESSION_FIELD_LENGTH) ||
     !isBoundedString(bl, MAX_SESSION_FIELD_LENGTH) ||
     !isBoundedString(at, MAX_SESSION_FIELD_LENGTH) ||
-    typeof path !== "string" || !/^\/(?:u\/\d{1,8}\/)?$/.test(path)
+    typeof path !== "string" || !PHOTOS_RPC_PATH.test(path)
   ) return null
 
   return { account, "f.sid": sid, bl, path, at }

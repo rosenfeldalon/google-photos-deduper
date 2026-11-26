@@ -102,6 +102,20 @@ describe("isolated Photos bridge", () => {
     expect(postMessage).not.toHaveBeenCalled()
   })
 
+  it.each([
+    ["/_/PhotosUi/", "https://photos.google.com/photo/fixture"],
+    ["/u/1/_/PhotosUi/", "https://photos.google.com/u/1/photo/fixture"],
+  ])("uses %s for RPCs and keeps the photo link on the library route", async (path, productUrl) => {
+    const routedSession = { ...session, path }
+    api.getItemsByTakenDate.mockResolvedValue({ items: [{ mediaKey: "fixture" }] })
+    await receive({ ...request, command: "getAllMediaItems", args: undefined, session: routedSession })
+    expect(createApi).toHaveBeenCalledExactlyOnceWith(routedSession)
+    expect(sendMessage).toHaveBeenCalledWith(expect.objectContaining({
+      action: "gptkResultChunk",
+      data: [expect.objectContaining({ productUrl })],
+    }))
+  })
+
   it.each(["rejected", "thrown", "stale"])("halts remaining batches after a %s acknowledgement", async failure => {
     if (failure === "rejected") sendMessage.mockRejectedValueOnce(new Error("send failed"))
     else if (failure === "thrown") sendMessage.mockImplementationOnce(() => { throw new Error("send failed") })

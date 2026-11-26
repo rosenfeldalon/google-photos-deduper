@@ -206,15 +206,16 @@ export async function openGptkStubPage(
   overrides: GptkOverrides = {}
 ): Promise<Page> {
   const account = overrides.healthCheck?.data.accountEmail ?? "test@example.com"
+  const rpcPath = "/_/PhotosUi/"
   const wiz = {
     oPEP7c: account, FdrFJe: "100", cfb2h: "fixture-version",
-    eptZe: "/", SNlM0e: "fixture-only",
+    eptZe: rpcPath, SNlM0e: "fixture-only",
   }
   const page = await context.newPage()
   await page.route("https://photos.google.com/**", async route => {
     const request = route.request()
     const url = new URL(request.url())
-    if (url.pathname !== "/data/batchexecute") {
+    if (url.pathname !== rpcPath + "data/batchexecute") {
       await route.fulfill({
         contentType: "text/html",
         body: `<!doctype html><title>Photos fixture</title>
