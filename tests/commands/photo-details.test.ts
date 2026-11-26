@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest"
-import { loadPhotoDetails, projectAlbums } from "../../lib/photo-details"
+import { loadPhotoDetails, projectAlbums, projectPhotoDetails } from "../../lib/photo-details"
 import { parsePhotosCommand } from "../../lib/photos-protocol"
 
 describe("album details", () => {
@@ -19,6 +19,23 @@ describe("album details", () => {
     expect(projectAlbums([])).toEqual({ albums: [] })
     expect(projectAlbums(undefined)).toMatchObject({ unavailable: true })
     expect(projectAlbums([{ mediaKey: "album-b", title: "Missing sharing status" }])).toMatchObject({ unavailable: true })
+  })
+
+  it("binds ownership to the requested media key and limits the owner image host", () => {
+    const row = {
+      mediaKey: "a", albums: [], source: ["mobile", "android"],
+      owner: { actorId: "fixture-owner", name: "Fixture", profilePhotoUrl: "https://lh3.googleusercontent.com/a" },
+      savedToYourPhotos: true,
+    }
+    expect(projectPhotoDetails("a", row)).toEqual({
+      albums: [], source: "mobile", ownerActorId: "fixture-owner", ownerName: "Fixture",
+      ownerPhotoUrl: row.owner.profilePhotoUrl, savedToYourPhotos: true,
+    })
+    expect(projectPhotoDetails("b", row)).toMatchObject({ unavailable: true })
+    expect(projectPhotoDetails("a", { ...row, mediaKey: undefined })).toEqual({ albums: [] })
+    expect(projectPhotoDetails("a", {
+      ...row, owner: { ...row.owner, profilePhotoUrl: "https://googleusercontent.com.example.test/a" },
+    })).toMatchObject({ ownerPhotoUrl: null })
   })
 
   it("limits concurrency to three and streams partial batches", async () => {

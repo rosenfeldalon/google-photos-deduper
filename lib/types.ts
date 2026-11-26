@@ -102,6 +102,7 @@ export interface GptkCommandMessage extends BaseMessage {
   command: string;
   args?: unknown;
   requestId: string;
+  accountEmail?: string;
 }
 
 export interface GptkCancelMessage extends BaseMessage {

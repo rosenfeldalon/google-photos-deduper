@@ -9,6 +9,7 @@ import { test, expect, type BrowserContext } from "@playwright/test"
 import {
   launchExtension,
   openAppTab,
+  openGptkStubPage,
   injectScanResults,
   injectSelections,
   clearStorage,
@@ -103,10 +104,11 @@ test("persists group selections through page reload", async () => {
   )
   await injectSelections(context, ["g1", "g3"], {})
 
+  const photos = await openGptkStubPage(context)
   const page = await openAppTab(context, extensionId)
   await expect(page.getByText("3 Duplicate Groups Found")).toBeVisible({ timeout: 5000 })
 
-  const checkboxes = page.locator('input[type="checkbox"]')
+  const checkboxes = page.getByRole("checkbox", { name: "Select eligible photos in this group" })
   await expect(checkboxes.nth(0)).toBeChecked()          // g1 selected
   await expect(checkboxes.nth(1)).not.toBeChecked()      // g2 deselected
   await expect(checkboxes.nth(2)).toBeChecked()          // g3 selected
@@ -118,6 +120,7 @@ test("persists group selections through page reload", async () => {
   await expect(checkboxes.nth(2)).toBeChecked()
 
   await page.close()
+  await photos.close()
   await clearStorage(context)
 })
 
@@ -133,6 +136,7 @@ test("persists kept overrides through page reload", async () => {
   )
   await injectSelections(context, ["g1"], { g1: ["key2"] })
 
+  const photos = await openGptkStubPage(context)
   const page = await openAppTab(context, extensionId)
   await expect(page.getByText("1 Duplicate Group Found")).toBeVisible({ timeout: 5000 })
 
@@ -147,5 +151,6 @@ test("persists kept overrides through page reload", async () => {
   await expect(cards.nth(1)).toContainText("Keep")
 
   await page.close()
+  await photos.close()
   await clearStorage(context)
 })

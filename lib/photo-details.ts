@@ -4,8 +4,25 @@ export interface PhotoAlbum {
   isShared: boolean
 }
 
+export interface LoadedPhotoDetails {
+  albums: readonly PhotoAlbum[]
+  source?: string | null
+  ownerActorId?: string | null
+  ownerName?: string | null
+  ownerPhotoUrl?: string | null
+  savedToYourPhotos?: boolean | null
+}
+
+interface PhotoItemInfo {
+  mediaKey?: string
+  albums?: unknown
+  source?: readonly (string | null)[]
+  owner?: { actorId?: string; name?: string; profilePhotoUrl?: string } | null
+  savedToYourPhotos?: boolean
+}
+
 export type PhotoDetails =
-  | { albums: readonly PhotoAlbum[] }
+  | LoadedPhotoDetails
   | { unavailable: true; reason: string }
 
 export interface PhotoDetailsRow {
@@ -15,7 +32,7 @@ export interface PhotoDetailsRow {
 
 export type PhotoDetailsEntry =
   | { status: "loading" }
-  | { status: "loaded"; details: Extract<PhotoDetails, { albums: readonly PhotoAlbum[] }> }
+  | { status: "loaded"; details: LoadedPhotoDetails }
   | { status: "unavailable"; reason: string }
 
 export const PHOTO_DETAILS_BATCH_SIZE = 3
@@ -41,15 +58,49 @@ export function projectAlbums(albums: unknown): PhotoDetails {
   return { albums: projected }
 }
 
+function boundedText(value: unknown, limit: number): string | null {
+  return typeof value === "string" && value.length <= limit && value.trim() ? value : null
+}
+
+function ownerImage(value: unknown): string | null {
+  const candidate = boundedText(value, 2048)
+  if (!candidate) return null
+  try {
+    const url = new URL(candidate)
+    if (url.protocol !== "https:" || url.username || url.password || url.port) return null
+    if (!/(^|\.)(googleusercontent\.com|usercontent\.google\.com)$/.test(url.hostname)) return null
+    return url.href
+  } catch {
+    return null
+  }
+}
+
+export function projectPhotoDetails(mediaKey: string, item?: PhotoItemInfo): PhotoDetails {
+  if (item?.mediaKey !== undefined && item.mediaKey !== mediaKey) {
+    return { unavailable: true, reason: "Photos returned information for a different item." }
+  }
+  const projected = projectAlbums(item?.albums)
+  if ("unavailable" in projected || item?.mediaKey !== mediaKey) return projected
+
+  return {
+    ...projected,
+    source: boundedText(item.source?.[0], 32),
+    ownerActorId: boundedText(item.owner?.actorId, 256),
+    ownerName: boundedText(item.owner?.name, 256),
+    ownerPhotoUrl: ownerImage(item.owner?.profilePhotoUrl),
+    savedToYourPhotos: typeof item.savedToYourPhotos === "boolean" ? item.savedToYourPhotos : null,
+  }
+}
+
 async function fetchPhotoDetails(
   key: string,
-  getDetails: (mediaKey: string) => Promise<{ albums?: unknown }>,
+  getDetails: (mediaKey: string) => Promise<PhotoItemInfo>,
   signal: AbortSignal
 ): Promise<PhotoDetailsRow> {
   for (let attempt = 0; attempt < ATTEMPTS && !signal.aborted; attempt++) {
     try {
       const item = await getDetails(key)
-      return { mediaKey: key, details: projectAlbums(item?.albums) }
+      return { mediaKey: key, details: projectPhotoDetails(key, item) }
     } catch (error) {
       // The pinned parser throws a TypeError when required fields are absent.
       if (error instanceof TypeError || attempt + 1 === ATTEMPTS || signal.aborted) break
@@ -61,7 +112,7 @@ async function fetchPhotoDetails(
 
 export async function loadPhotoDetails(
   keys: string[],
-  getDetails: (mediaKey: string) => Promise<{ albums?: unknown }>,
+  getDetails: (mediaKey: string) => Promise<PhotoItemInfo>,
   emit: (rows: PhotoDetailsRow[], done: number, total: number, index: number) => void | Promise<void>,
   signal: AbortSignal
 ): Promise<void> {

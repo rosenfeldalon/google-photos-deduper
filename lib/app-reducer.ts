@@ -107,9 +107,9 @@ export function appReducer(state: AppState, action: AppAction): AppState {
           if (!areScanResultsValid({ accountEmail: state.accountEmail }, { accountEmail: action.payload.accountEmail })) {
             return { status: "connected", hasGptk: action.payload.hasGptk, accountEmail: action.payload.accountEmail }
           }
-          const email = action.payload.accountEmail ?? state.accountEmail
-          if (email === state.accountEmail) return state
-          return { ...state, accountEmail: email }
+          // Older saved reports remain viewable. A connection does not assign
+          // the current account to a scan that has no recorded owner account.
+          return state
         }
         return { status: "connected", hasGptk: action.payload.hasGptk, accountEmail: action.payload.accountEmail }
       }

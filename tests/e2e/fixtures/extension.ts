@@ -132,7 +132,10 @@ export async function injectScanResults(
     ({ groups, mediaItems, totalItems }) =>
       new Promise<void>((resolve) => {
         chrome.storage.local.set(
-          { scanResults: { groups, mediaItems, totalItems, scanDate: Date.now() } },
+          {
+            scanResults: { groups, mediaItems, totalItems, scanDate: Date.now(), accountEmail: "test@example.com" },
+            "photosOwner:test@example.com": { actorId: "fixture-owner" },
+          },
           resolve
         )
       }),
@@ -234,6 +237,16 @@ export async function openGptkStubPage(
         return [`mk${n}`, ["https://fixture.invalid/thumb", 100, 100], timestamp, `dk${n}`, 0, timestamp, null, []]
       })
       payload = [items, end < count ? String(end) : null, null]
+    } else if (rpc === "fDcn4b") {
+      const row: unknown[] = []
+      row[0] = requestData[0]
+      row[12] = []
+      row[19] = []
+      row[27] = [2]
+      const owner: unknown[] = ["fixture-owner"]
+      owner[11] = ["Fixture Owner"]
+      row[28] = owner
+      payload = [row]
     } else if (rpc === "XwAOJf") {
       const failure = requestData[1] === 1 ? overrides.trashItems : overrides.restoreItems
       if (failure) {
