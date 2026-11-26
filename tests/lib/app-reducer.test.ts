@@ -116,6 +116,14 @@ describe("HEALTH_CHECK_RESULT", () => {
     expect((next as { accountEmail?: string }).accountEmail).toBe("bob@example.com")
   })
 
+  it("does not assign an account to an older saved scan", () => {
+    const next = appReducer(resultsState, {
+      type: "HEALTH_CHECK_RESULT",
+      payload: { app: APP_ID, action: "healthCheck.result", success: true, hasGptk: true, accountEmail: "new@example.com" },
+    })
+    expect(next).toBe(resultsState)
+  })
+
   it("keeps results when the same account reconnects", () => {
     const state: AppState = { status: "results", mediaItems, groups, totalItems: 4, accountEmail: "alice@example.com" }
     const next = appReducer(state, {

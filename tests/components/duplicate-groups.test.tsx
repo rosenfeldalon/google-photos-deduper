@@ -11,6 +11,7 @@ import { describe, it, expect, vi } from "vitest"
 import { render, screen, fireEvent, act } from "@testing-library/react"
 import { ThemeProvider, createTheme } from "@mui/material/styles"
 import { DuplicateGroups } from "../../components/DuplicateGroups"
+import type { Provenance } from "../../lib/photo-provenance"
 import type { GpdMediaItem, DuplicateGroup } from "../../lib/types"
 
 // ============================================================
@@ -77,6 +78,23 @@ const defaultProps = {
   onToggleKept: vi.fn(),
   onTrashWholeGroup: vi.fn(),
 }
+
+it("shows mixed ownership and protects non-owned items on their actual group cards", () => {
+  const onToggleKept = vi.fn()
+  wrap(<DuplicateGroups
+    {...defaultProps}
+    onToggleKept={onToggleKept}
+    keptByGroupId={new Map([["g1", new Set(["img1", "img2"])]])}
+    provenanceByKey={new Map<string, Provenance>([["img1", "mine"], ["img2", "shared"], ["img3", "mine"]])}
+    selectionReady
+  />)
+  expect(screen.getByText(/Mixed ownership/)).toBeVisible()
+  const protectedPhoto = screen.getByRole("checkbox", { name: "Move img2.jpg to trash" })
+  expect(protectedPhoto).toBeDisabled()
+  expect(protectedPhoto).not.toBeChecked()
+  fireEvent.click(protectedPhoto)
+  expect(onToggleKept).not.toHaveBeenCalled()
+})
 
 // ============================================================
 // Chip rendering

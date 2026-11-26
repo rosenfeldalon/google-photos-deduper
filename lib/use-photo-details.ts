@@ -16,11 +16,12 @@ function isDetailRow(value: unknown): value is PhotoDetailsRow {
       Array.isArray(row.details.albums))
 }
 
-export function usePhotoDetails(account: string | null, groups: DuplicateGroup[], enabled: boolean) {
+export function usePhotoDetails(account: string | null, groups: DuplicateGroup[], enabled: boolean, requireAll = false) {
   const [cache, dispatch] = useReducer(reduceDetailsCache, account, createDetailsCache)
   const available = enabled && account !== null && account === cache.account
   const entries = cache.account === account ? cache.entries : EMPTY
   const request = available ? cache.request : null
+  const loadEveryGroup = requireAll || cache.loadAll
 
   const allKeys = useMemo(() => [...new Set(groups.flatMap(group => group.mediaKeys))], [groups])
   const autoKeys = useMemo(() => [...new Set(groups.slice(0, AUTO_GROUPS).flatMap(group => group.mediaKeys))], [groups])
@@ -36,9 +37,9 @@ export function usePhotoDetails(account: string | null, groups: DuplicateGroup[]
       return
     }
     if (request) return
-    const keys = (cache.loadAll ? allKeys : autoKeys).filter(key => !entries.has(key)).slice(0, MAX_DETAIL_KEYS)
+    const keys = (loadEveryGroup ? allKeys : autoKeys).filter(key => !entries.has(key)).slice(0, MAX_DETAIL_KEYS)
     if (keys.length) dispatch({ type: "start", request: { id: createRequestId(), keys } })
-  }, [allKeys, autoKeys, available, cache.loadAll, entries, request])
+  }, [allKeys, autoKeys, available, loadEveryGroup, entries, request])
 
   useEffect(() => {
     if (!request) return
@@ -71,6 +72,7 @@ export function usePhotoDetails(account: string | null, groups: DuplicateGroup[]
     arm()
     void chrome.runtime.sendMessage({
       app: APP_ID, action: "gptkCommand", command: "getItemDetails", requestId: id, args: { mediaKeys: keys },
+      accountEmail: account,
     }).catch(finish)
 
     return () => {
@@ -78,12 +80,16 @@ export function usePhotoDetails(account: string | null, groups: DuplicateGroup[]
       chrome.runtime.onMessage.removeListener(listener)
       if (!settled) void chrome.runtime.sendMessage({ app: APP_ID, action: "gptkCancel", requestId: id }).catch(() => {})
     }
-  }, [request])
+  }, [account, request])
 
   return {
     entries,
     requestAll: loadAll,
-    canLoadMore: available && !cache.loadAll && allKeys.length > autoKeys.length,
+    canLoadMore: available && !loadEveryGroup && allKeys.length > autoKeys.length,
+    allResolved: available && allKeys.every(key => {
+      const status = entries.get(key)?.status
+      return status === "loaded" || status === "unavailable"
+    }),
     progress: request ? {
       done: request.keys.filter(key => entries.get(key)?.status !== "loading").length,
       total: request.keys.length,

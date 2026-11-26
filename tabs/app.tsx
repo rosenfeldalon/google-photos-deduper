@@ -6,11 +6,6 @@ import Button from "@mui/material/Button"
 import CircularProgress from "@mui/material/CircularProgress"
 import LinearProgress from "@mui/material/LinearProgress"
 import CssBaseline from "@mui/material/CssBaseline"
-import Dialog from "@mui/material/Dialog"
-import DialogActions from "@mui/material/DialogActions"
-import DialogContent from "@mui/material/DialogContent"
-import DialogContentText from "@mui/material/DialogContentText"
-import DialogTitle from "@mui/material/DialogTitle"
 import IconButton from "@mui/material/IconButton"
 import Snackbar from "@mui/material/Snackbar"
 import { ThemeProvider } from "@mui/material/styles"
@@ -21,8 +16,10 @@ import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "r
 
 import { ActionBar } from "../components/ActionBar"
 import { DuplicateGroups } from "../components/DuplicateGroups"
+import { OwnerConfirmation, ProvenanceSummary } from "../components/PhotoProvenance"
 import { ScanConfig } from "../components/ScanConfig"
 import { ScanProgress } from "../components/ScanProgress"
+import { TrashConfirmation, type TrashPlan } from "../components/TrashConfirmation"
 import { appReducer } from "../lib/app-reducer"
 import type { AppAction, AppState } from "../lib/app-reducer"
 import { debug } from "../lib/debug"
@@ -31,16 +28,16 @@ import {
   smartDetectDuplicates
 } from "../lib/duplicate-detector"
 import type { DetectionProgress } from "../lib/duplicate-detector"
-import { selectDefaultKeep } from "../lib/duplicate-detector"
+import {
+  classifyProvenance, defaultProvenanceKeeps, describeSkippedTrash, guardTrashSelection, inferOwner, mayManuallyTrash
+} from "../lib/photo-provenance"
+import type { Provenance } from "../lib/photo-provenance"
 import { createRequestId } from "../lib/photos-protocol"
 import { ScanLogger } from "../lib/scan-log"
 import theme from "../lib/theme"
 import { APP_ID, DEFAULT_SETTINGS } from "../lib/types"
 import { usePhotoDetails } from "../lib/use-photo-details"
-import {
-  countFullyTrashedGroups,
-  toggleWholeGroupTrashed
-} from "../lib/kept-overrides"
+import { usePhotoOwner } from "../lib/use-photo-owner"
 import type {
   AppMessage,
   DuplicateGroup,
@@ -99,30 +96,25 @@ export default function App() {
   >({})
 
   // Confirm dialog state
-  const [trashConfirm, setTrashConfirm] = useState<{
-    dedupKeys: string[]
-    mediaKeysToTrash: string[]
-    fullyTrashedGroups: number
-  } | null>(null)
+  const [trashConfirm, setTrashConfirm] = useState<TrashPlan | null>(null)
+  const [manualShared, setManualShared] = useState<Set<string>>(new Set())
+  const [trashNotice, setTrashNotice] = useState<string>()
 
-  // Undo trash state: stored after a successful trash operation
-  const [undoData, setUndoData] = useState<{
-    dedupKeys: string[]
-    count: number
-    snapshot: {
-      mediaItems: Record<string, GpdMediaItem>
-      groups: DuplicateGroup[]
-      totalItems: number
-    }
-  } | null>(null)
-
-  // Refs to capture pre-trash data for undo
-  const preTrashSnapshotRef = useRef<{
+  type Snapshot = {
     mediaItems: Record<string, GpdMediaItem>
     groups: DuplicateGroup[]
     totalItems: number
-  } | null>(null)
-  const pendingDedupKeysRef = useRef<string[] | null>(null)
+  }
+  type TrashOperation = {
+    requestId: string
+    account: string
+    dedupKeys: string[]
+    count: number
+    snapshot: Snapshot
+    progressCounts: number[]
+  }
+  const [undoData, setUndoData] = useState<TrashOperation | null>(null)
+  const pendingTrashRef = useRef<TrashOperation | null>(null)
 
   // AbortController for the current scan (cancelled on user request or new scan)
   const scanAbortRef = useRef<AbortController | null>(null)
@@ -188,7 +180,17 @@ export default function App() {
       ? state.groups
       : null
   const groups = useMemo(() => stateGroups ?? [], [stateGroups])
-  const photoDetails = usePhotoDetails(photosAccount, groups, state.status === "results")
+  const resultsAccount = state.status === "results" && state.accountEmail === photosAccount ? photosAccount : null
+  const photoDetails = usePhotoDetails(resultsAccount, groups, state.status === "results", true)
+  const photoOwner = usePhotoOwner(resultsAccount)
+  const selfActorId = photoOwner.decision?.actorId
+  const selectionReady = photoDetails.allResolved && !!selfActorId
+
+  useEffect(() => {
+    setManualShared(new Set())
+    setTrashConfirm(null)
+    setTrashNotice(undefined)
+  }, [resultsAccount, groups])
   useEffect(() => {
     if (pendingSelectionsRef.current) {
       const saved = pendingSelectionsRef.current
@@ -209,22 +211,6 @@ export default function App() {
     }
   }, [groups])
 
-  const handleToggleGroup = useCallback((groupId: string) => {
-    setSelectedGroupIds((prev) => {
-      const next = new Set(prev)
-      if (next.has(groupId)) next.delete(groupId)
-      else next.add(groupId)
-      return next
-    })
-  }, [])
-
-  const handleSelectAll = useCallback(() => {
-    setSelectedGroupIds(new Set(groups.map((g) => g.id)))
-  }, [groups])
-
-  const handleDeselectAll = useCallback(() => {
-    setSelectedGroupIds(new Set())
-  }, [])
 
   // Listen for messages from service worker
   useEffect(() => {
@@ -334,20 +320,13 @@ export default function App() {
               })
             }
           } else if (result.command === "trashItems") {
+            const operation = pendingTrashRef.current
+            if (!operation || operation.requestId !== result.requestId) break
+            pendingTrashRef.current = null
             if (result.success) {
               const data = result.data as { trashedKeys: string[] }
-              const trashedKeys = data.trashedKeys || []
-              dispatch({ type: "TRASH_COMPLETE", trashedKeys })
-              // Set undo data from the snapshot captured before trash
-              if (preTrashSnapshotRef.current && pendingDedupKeysRef.current) {
-                setUndoData({
-                  dedupKeys: pendingDedupKeysRef.current,
-                  count: pendingDedupKeysRef.current.length,
-                  snapshot: preTrashSnapshotRef.current
-                })
-                preTrashSnapshotRef.current = null
-                pendingDedupKeysRef.current = null
-              }
+              dispatch({ type: "TRASH_COMPLETE", trashedKeys: data.trashedKeys || [] })
+              setUndoData(operation)
             } else {
               dispatch({
                 type: "TRASH_ERROR",
@@ -381,8 +360,10 @@ export default function App() {
           }
           if (progress.command === "getAllMediaItems" && progress.requestId !== currentScanRequestIdRef.current) break
           if (progress.command === "trashItems") {
-            console.log(`[GPD] trash progress: ${progress.itemsProcessed}`)
-            dispatch({ type: "TRASH_PROGRESS", trashedSoFar: progress.itemsProcessed })
+            const operation = pendingTrashRef.current
+            if (!operation || operation.requestId !== progress.requestId) break
+            const trashedSoFar = operation.progressCounts[progress.itemsProcessed - 1]
+            if (trashedSoFar !== undefined) dispatch({ type: "TRASH_PROGRESS", trashedSoFar })
           } else if (progress.command === "restoreItems") {
             console.log(`[GPD] restore progress: ${progress.itemsProcessed}`)
           } else {
@@ -526,62 +507,123 @@ export default function App() {
   // Persist scan results when they change (after scan or trash)
   const mediaItems = state.status === "results" ? state.mediaItems : null
 
-  // Stable default kept sets (one per group, only changes when groups or mediaItems change).
-  // Uses smart keep selection: original quality > higher resolution > oldest upload date.
-  const defaultKeptSets = useMemo(() => {
-    const m = new Map<string, Set<string>>()
-    for (const g of groups) {
-      const groupItems = mediaItems
-        ? g.mediaKeys.map((k) => mediaItems[k]).filter(Boolean)
-        : []
-      const defaultKey =
-        groupItems.length > 0 ? selectDefaultKeep(groupItems) : g.originalMediaKey
-      m.set(g.id, new Set([defaultKey]))
-    }
-    return m
-  }, [groups, mediaItems])
+  const scanItems = useMemo(() => mediaItems ? Object.values(mediaItems) : [], [mediaItems])
+  const groupItems = useMemo(() => mediaItems
+    ? [...new Set(groups.flatMap(group => group.mediaKeys))].map(key => mediaItems[key]).filter(Boolean)
+    : [], [groups, mediaItems])
+  const candidate = useMemo(() => photoDetails.allResolved && !selfActorId
+    ? inferOwner(groupItems, photoDetails.entries)
+    : undefined, [groupItems, photoDetails.allResolved, photoDetails.entries, selfActorId])
+  const ownerCandidate = photoOwner.ready && candidate?.actorId !== photoOwner.decision?.rejectedActorId ? candidate : undefined
 
-  const getKept = useCallback(
-    (group: DuplicateGroup): Set<string> =>
-      keptOverrides[group.id] ?? defaultKeptSets.get(group.id) ?? new Set([group.originalMediaKey]),
-    [keptOverrides, defaultKeptSets]
-  )
+  const provenanceByKey = useMemo(() => new Map<string, Provenance>(
+    groupItems.map(item => [item.mediaKey, classifyProvenance(item, photoDetails.entries.get(item.mediaKey), selfActorId)])
+  ), [groupItems, photoDetails.entries, selfActorId])
+  const kindOf = useCallback((key: string) => provenanceByKey.get(key) ?? "unknown", [provenanceByKey])
 
-  // Per-group kept sets: overridden groups use the live override Set (changes only for
-  // the toggled group); unoverridden groups reuse the stable default Set from above so
-  // React.memo on DuplicateGroupRow skips re-renders for unaffected rows.
   const keptByGroupId = useMemo(() => {
-    const m = new Map<string, Set<string>>()
-    for (const g of groups) {
-      m.set(g.id, keptOverrides[g.id] ?? defaultKeptSets.get(g.id)!)
+    const next = new Map<string, Set<string>>()
+    for (const group of groups) {
+      const items = group.mediaKeys.map(key => mediaItems?.[key]).filter((item): item is GpdMediaItem => !!item)
+      const kept = new Set(keptOverrides[group.id] ?? defaultProvenanceKeeps(items, kindOf))
+      for (const key of group.mediaKeys) {
+        const kind = kindOf(key)
+        if (!selectionReady || !mayManuallyTrash(kind) || (kind === "mine-in-shared-album" && !manualShared.has(key))) kept.add(key)
+      }
+      next.set(group.id, kept)
     }
-    return m
-  }, [groups, keptOverrides, defaultKeptSets])
+    return next
+  }, [groups, keptOverrides, kindOf, manualShared, mediaItems, selectionReady])
 
-  const handleToggleKept = useCallback(
-    (group: DuplicateGroup, mediaKey: string) => {
-      setKeptOverrides((prev) => {
-        const current = prev[group.id] ?? defaultKeptSets.get(group.id) ?? new Set([group.originalMediaKey])
-        // Prevent removing the last kept item
-        if (current.has(mediaKey) && current.size === 1) return prev
-        const next = new Set(current)
-        if (next.has(mediaKey)) {
-          next.delete(mediaKey)
-        } else {
-          next.add(mediaKey)
-        }
-        return { ...prev, [group.id]: next }
-      })
-    },
-    [defaultKeptSets]
-  )
+  const selectedGroups = useMemo(() => new Set(groups
+    .filter(group => selectedGroupIds.has(group.id) && group.mediaKeys.some(key => !keptByGroupId.get(group.id)?.has(key)))
+    .map(group => group.id)), [groups, keptByGroupId, selectedGroupIds])
 
-  // Trash an entire group. This is the only path that leaves a group with no
-  // survivor — the per-photo toggle above still refuses to remove the last
-  // kept item, so a group can only be emptied deliberately.
-  const handleTrashWholeGroup = useCallback((group: DuplicateGroup) => {
-    setKeptOverrides((prev) => toggleWholeGroupTrashed(prev, group.id))
+  const handleToggleGroup = useCallback((groupId: string) => {
+    const group = groups.find(item => item.id === groupId)
+    const kept = keptByGroupId.get(groupId)
+    if (!selectionReady || !group || !kept || group.mediaKeys.every(key => kept.has(key))) return
+    if (selectedGroups.has(groupId)) {
+      setManualShared(previous => new Set([...previous].filter(key => !group.mediaKeys.includes(key))))
+    }
+    setSelectedGroupIds(previous => {
+      const next = new Set(previous)
+      if (selectedGroups.has(groupId)) next.delete(groupId)
+      else next.add(groupId)
+      return next
+    })
+  }, [groups, keptByGroupId, selectedGroups, selectionReady])
+
+  const handleSelectAll = useCallback(() => {
+    if (!selectionReady) return
+    setManualShared(new Set())
+    setSelectedGroupIds(new Set(groups.map(group => group.id)))
+  }, [groups, selectionReady])
+
+  const handleDeselectAll = useCallback(() => {
+    setManualShared(new Set())
+    setSelectedGroupIds(new Set())
   }, [])
+
+  const handleToggleKept = useCallback((group: DuplicateGroup, key: string) => {
+    const kind = kindOf(key)
+    const current = keptByGroupId.get(group.id)
+    if (!selectionReady || !mayManuallyTrash(kind) || !current) return
+    // When the group was unchecked, checking a photo selects the group and
+    // leaves its existing per-photo choices intact.
+    const markForTrash = !selectedGroups.has(group.id) || current.has(key)
+    if (markForTrash && current.has(key) && current.size === 1) {
+      setTrashNotice("To move every eligible photo in a group, use the group trash button.")
+      return
+    }
+    const next = new Set(current)
+    if (markForTrash) next.delete(key)
+    else next.add(key)
+    setKeptOverrides(previous => ({ ...previous, [group.id]: next }))
+    if (kind === "mine-in-shared-album") {
+      setManualShared(previous => {
+        const chosen = new Set(previous)
+        if (markForTrash) chosen.add(key)
+        else chosen.delete(key)
+        return chosen
+      })
+    }
+    if (markForTrash) setSelectedGroupIds(previous => new Set([...previous, group.id]))
+    setTrashNotice(undefined)
+  }, [keptByGroupId, kindOf, selectedGroups, selectionReady])
+
+  const handleTrashWholeGroup = useCallback((group: DuplicateGroup) => {
+    if (!selectionReady) return
+    const mine = group.mediaKeys.filter(key => kindOf(key) === "mine")
+    const current = keptByGroupId.get(group.id)
+    if (!mine.length || !current) return
+    const allMarked = selectedGroups.has(group.id) && mine.every(key => !current.has(key))
+    setManualShared(previous => new Set([...previous].filter(key => !group.mediaKeys.includes(key))))
+    setKeptOverrides(previous => {
+      const next = { ...previous }
+      if (allMarked) delete next[group.id]
+      else next[group.id] = new Set(group.mediaKeys.filter(key => kindOf(key) !== "mine"))
+      return next
+    })
+    if (!allMarked) setSelectedGroupIds(previous => new Set([...previous, group.id]))
+    setTrashNotice(undefined)
+  }, [keptByGroupId, kindOf, selectedGroups, selectionReady])
+
+  const requestedTrashKeys = useMemo(() => groups.flatMap(group =>
+    selectedGroups.has(group.id)
+      ? group.mediaKeys.filter(key => !keptByGroupId.get(group.id)?.has(key))
+      : []
+  ), [groups, keptByGroupId, selectedGroups])
+
+  const buildTrashPlan = useCallback(() => {
+    if (!selectionReady || !resultsAccount || state.status !== "results") return null
+    const guarded = guardTrashSelection(
+      requestedTrashKeys, state.mediaItems, photoDetails.entries, selfActorId, manualShared
+    )
+    const affected = new Set(guarded.mediaKeysToTrash)
+    const fullyTrashedGroups = groups.filter(group => group.mediaKeys.every(key => affected.has(key))).length
+    return { ...guarded, account: resultsAccount, fullyTrashedGroups }
+  }, [groups, manualShared, photoDetails.entries, requestedTrashKeys, resultsAccount, selectionReady, selfActorId, state])
 
   const totalItems = state.status === "results" ? state.totalItems : 0
   const accountEmailForStorage = state.status === "results" ? state.accountEmail : undefined
@@ -657,6 +699,7 @@ export default function App() {
       action: "gptkCommand",
       command: "getAllMediaItems",
       requestId,
+      accountEmail,
       args: {
         dateRange: settings.dateRange
       }
@@ -664,50 +707,53 @@ export default function App() {
   }, [settings, armFetchWatchdog])
 
   const handleTrash = useCallback(() => {
-    if (state.status !== "results") return
-
-    const dedupKeys: string[] = []
-    const mediaKeysToTrash: string[] = []
-    for (const group of state.groups) {
-      if (!selectedGroupIds.has(group.id)) continue
-      const keptSet = getKept(group)
-      for (const key of group.mediaKeys) {
-        if (keptSet.has(key)) continue
-        const item = state.mediaItems[key]
-        if (item?.dedupKey) {
-          dedupKeys.push(item.dedupKey)
-          mediaKeysToTrash.push(key)
-        }
-      }
+    const plan = buildTrashPlan()
+    if (!plan) return
+    if (!plan.dedupKeys.length) {
+      const skipped = describeSkippedTrash(plan.skipped)
+      if (skipped) setTrashNotice("Skipped: " + skipped + ".")
+      return
     }
-
-    if (dedupKeys.length === 0) return
-    const fullyTrashedGroups = countFullyTrashedGroups(
-      state.groups,
-      selectedGroupIds,
-      getKept
-    )
-    setTrashConfirm({ dedupKeys, mediaKeysToTrash, fullyTrashedGroups })
-  }, [state, selectedGroupIds, getKept])
+    setTrashNotice(undefined)
+    setTrashConfirm(plan)
+  }, [buildTrashPlan])
 
   const handleTrashConfirmed = useCallback(() => {
-    if (!photosConnected || !trashConfirm || state.status !== "results") return
-    const { dedupKeys, mediaKeysToTrash } = trashConfirm
+    if (!trashConfirm || state.status !== "results") return
+    const checked = buildTrashPlan()
+    if (!checked || !checked.dedupKeys.length) {
+      setTrashConfirm(null)
+      setTrashNotice("The selection is no longer eligible. Check the Photos connection and ownership details.")
+      return
+    }
+    if (JSON.stringify(checked) !== JSON.stringify(trashConfirm)) {
+      setTrashConfirm(checked)
+      setTrashNotice("The selection changed. Review it again before confirming.")
+      return
+    }
+    const { dedupKeys, mediaKeysToTrash } = checked
     setTrashConfirm(null)
 
     const requestId = createRequestId()
 
-    // Capture snapshot for undo
-    preTrashSnapshotRef.current = {
-      mediaItems: state.mediaItems,
-      groups: state.groups,
-      totalItems: state.totalItems
+    const copiesByDedup = new Map<string, number>()
+    for (const key of mediaKeysToTrash) {
+      const id = state.mediaItems[key].dedupKey
+      copiesByDedup.set(id, (copiesByDedup.get(id) ?? 0) + 1)
     }
-    pendingDedupKeysRef.current = dedupKeys
+    let movedSoFar = 0
+    pendingTrashRef.current = {
+      requestId,
+      account: checked.account,
+      dedupKeys,
+      count: mediaKeysToTrash.length,
+      progressCounts: dedupKeys.map(id => movedSoFar += copiesByDedup.get(id) ?? 0),
+      snapshot: { mediaItems: state.mediaItems, groups: state.groups, totalItems: state.totalItems },
+    }
 
     dispatch({
       type: "TRASH_STARTED",
-      totalToTrash: dedupKeys.length,
+      totalToTrash: mediaKeysToTrash.length,
       mediaItems: state.mediaItems,
       groups: state.groups,
       totalItems: state.totalItems
@@ -718,9 +764,10 @@ export default function App() {
       action: "gptkCommand",
       command: "trashItems",
       requestId,
-      args: { dedupKeys, mediaKeysToTrash }
+      args: { dedupKeys, mediaKeysToTrash },
+      accountEmail: checked.account
     })
-  }, [photosConnected, trashConfirm, state])
+  }, [buildTrashPlan, trashConfirm, state])
 
   const handleCancelScan = useCallback(() => {
     scanAbortRef.current?.abort()
@@ -741,7 +788,7 @@ export default function App() {
   }, [clearFetchWatchdog])
 
   const handleUndo = useCallback(() => {
-    if (!undoData) return
+    if (!undoData || undoData.account !== photosAccount) return
     // Optimistically restore the UI to the pre-trash state
     dispatch({
       type: "RESTORE_SNAPSHOT",
@@ -755,10 +802,11 @@ export default function App() {
       action: "gptkCommand",
       command: "restoreItems",
       requestId: createRequestId(),
-      args: { dedupKeys: undoData.dedupKeys }
+      args: { dedupKeys: undoData.dedupKeys },
+      accountEmail: undoData.account
     })
     setUndoData(null)
-  }, [undoData])
+  }, [photosAccount, undoData])
 
   const handleUndoClose = useCallback(() => {
     setUndoData(null)
@@ -774,15 +822,18 @@ export default function App() {
     })
   }, [undoData])
 
-  // Compute duplicate count for ActionBar
-  const duplicateCount =
-    state.status === "results"
-      ? groups.reduce((sum, group) => {
-          if (!selectedGroupIds.has(group.id)) return sum
-          const keptSet = keptByGroupId.get(group.id)!
-          return sum + group.mediaKeys.filter((k) => !keptSet.has(k)).length
-        }, 0)
-      : 0
+  const guardedPlan = useMemo(buildTrashPlan, [buildTrashPlan])
+  const duplicateCount = guardedPlan?.mediaKeysToTrash.length ?? 0
+  const skippedSelection = guardedPlan ? describeSkippedTrash(guardedPlan.skipped) : ""
+  const ownerReason = !photosConnected
+    ? "Connect to Google Photos to check ownership."
+    : !resultsAccount
+      ? "Re-scan the connected account to confirm that these results belong to it."
+      : !photoDetails.allResolved || !photoOwner.ready
+        ? "Checking ownership for every photo in duplicate groups before trash is available."
+        : ownerCandidate
+          ? "Confirm this is your Google Photos owner before selecting photos for trash."
+          : "Ownership is unconfirmed. Photos stay protected until a matching owner can be confirmed."
 
   return (
     <ThemeProvider theme={theme}>
@@ -886,16 +937,30 @@ export default function App() {
               totalItems={state.totalItems}
               groupCount={groups.length}
               duplicateCount={duplicateCount}
-              trashDisabled={!photosConnected}
+              trashDisabled={!selectionReady}
               onSelectAll={handleSelectAll}
               onDeselectAll={handleDeselectAll}
               onTrash={handleTrash}
               onRescan={handleReset}
             />
+            {!selectionReady && (
+              <OwnerConfirmation
+                candidate={ownerCandidate}
+                reason={ownerReason}
+                onConfirm={() => { if (ownerCandidate) photoOwner.choose(ownerCandidate.actorId, true) }}
+                onReject={() => { if (ownerCandidate) photoOwner.choose(ownerCandidate.actorId, false) }}
+              />
+            )}
+            {(trashNotice || skippedSelection) && (
+              <Alert severity="info" sx={{ mb: 2 }}>{trashNotice || "Skipped: " + skippedSelection + "."}</Alert>
+            )}
+            <ProvenanceSummary items={scanItems} kinds={provenanceByKey} details={photoDetails.entries} />
             <DuplicateGroups
               groups={state.groups}
               mediaItems={state.mediaItems}
-              selectedGroupIds={selectedGroupIds}
+              selectedGroupIds={selectedGroups}
+              provenanceByKey={provenanceByKey}
+              selectionReady={selectionReady}
               onToggleGroup={handleToggleGroup}
               keptByGroupId={keptByGroupId}
               onToggleKept={handleToggleKept}
@@ -929,34 +994,12 @@ export default function App() {
         )}
       </Box>
 
-      {/* Trash confirm dialog */}
-      <Dialog open={!!trashConfirm} onClose={() => setTrashConfirm(null)}>
-        <DialogTitle>Move to Trash</DialogTitle>
-        <DialogContent>
-          <DialogContentText>
-            Move {trashConfirm?.dedupKeys.length} duplicate
-            {trashConfirm?.dedupKeys.length !== 1 ? "s" : ""} to trash? You can
-            restore them from the Google Photos trash.
-          </DialogContentText>
-          {!!trashConfirm?.fullyTrashedGroups && (
-            <DialogContentText sx={{ mt: 2 }} color="error">
-              {trashConfirm.fullyTrashedGroups} group
-              {trashConfirm.fullyTrashedGroups !== 1 ? "s" : ""} will be removed
-              entirely — no copy will be kept.
-            </DialogContentText>
-          )}
-        </DialogContent>
-        <DialogActions>
-          <Button onClick={() => setTrashConfirm(null)}>Cancel</Button>
-          <Button
-            onClick={handleTrashConfirmed}
-            disabled={!photosConnected}
-            variant="contained"
-            color="error">
-            Move to Trash
-          </Button>
-        </DialogActions>
-      </Dialog>
+      <TrashConfirmation
+        plan={trashConfirm}
+        ready={selectionReady}
+        onConfirm={handleTrashConfirmed}
+        onClose={() => setTrashConfirm(null)}
+      />
 
       {/* Undo trash snackbar */}
       <Snackbar
@@ -971,7 +1014,7 @@ export default function App() {
         }
         action={
           <>
-            <Button color="secondary" size="small" onClick={handleUndo}>
+            <Button color="secondary" size="small" onClick={handleUndo} disabled={undoData?.account !== photosAccount}>
               Undo
             </Button>
             <IconButton size="small" color="inherit" onClick={handleUndoClose}>
