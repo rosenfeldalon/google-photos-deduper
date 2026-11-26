@@ -26,6 +26,8 @@ Uses [Google Photos Toolkit (GPTK)](https://github.com/xob0t/Google-Photos-Toolk
 3. Click **Scan Library** - the extension fetches your media items and uses MediaPipe image embeddings locally to find visually identical photos
 4. Review the duplicate groups, select which to keep, and click **Move to Trash**
 
+Album information loads automatically for the first six groups. Use **Load album info** to check the remaining groups. Shared albums have a group icon, and a dash indicates that Photos did not provide album information.
+
 No OAuth setup. No Google Cloud project. No data leaves your browser.
 
 ## Development

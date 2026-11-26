@@ -1,9 +1,10 @@
 import type Api from "../Google-Photos-Toolkit/src/api/api"
+import { loadPhotoDetails, PHOTO_DETAILS_BATCH_SIZE } from "./photo-details"
 import { MAX_RESULT_BYTES, PHOTOS_ORIGIN, serializedSize } from "./photos-protocol"
 import type { PhotosCommand, PhotosReply } from "./photos-protocol"
 import { APP_ID, type GpdMediaItem } from "./types"
 
-export type PhotosApi = Pick<Api, "getItemsByTakenDate" | "moveItemsToTrash" | "restoreFromTrash">
+export type PhotosApi = Pick<Api, "getItemsByTakenDate" | "getItemInfoExt" | "moveItemsToTrash" | "restoreFromTrash">
 type Emit = (reply: PhotosReply) => void | Promise<void>
 
 const BATCH_SIZE = 250
@@ -101,12 +102,23 @@ export async function executePhotosCommand(
   accountPath: string,
   api: PhotosApi,
   emit: Emit,
+  signal = new AbortController().signal,
 ): Promise<void> {
   const { command } = request
   const reply = { app: APP_ID, command, requestId }
   try {
     if (command === "getAllMediaItems") {
       await scanLibrary(api, accountPath, requestId, emit)
+      return
+    }
+    if (command === "getItemDetails") {
+      const totalChunks = Math.ceil(request.mediaKeys.length / PHOTO_DETAILS_BATCH_SIZE)
+      await loadPhotoDetails(request.mediaKeys, key => api.getItemInfoExt(key), async (rows, done, total, index) => {
+        await emit({ ...reply, action: "gptkProgress", itemsProcessed: done, totalItems: total })
+        await emit({
+          ...reply, action: "gptkResultChunk", chunkIndex: index, totalChunks, data: rows,
+        })
+      }, signal)
       return
     }
     if (command === "healthCheck") return
@@ -132,6 +144,7 @@ export async function executePhotosCommand(
         : { restoredCount: dedupKeys.length },
     })
   } catch (failure) {
+    if (signal.aborted) return
     const httpStatus = failure instanceof Error ? /^HTTP \d{3}\b/.exec(failure.message)?.[0] : undefined
     const error = failure instanceof PhotosCommandError
       ? failure.message

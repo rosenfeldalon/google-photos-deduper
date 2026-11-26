@@ -104,6 +104,11 @@ export interface GptkCommandMessage extends BaseMessage {
   requestId: string;
 }
 
+export interface GptkCancelMessage extends BaseMessage {
+  action: "gptkCancel";
+  requestId: string;
+}
+
 export interface GptkResultMessage extends BaseMessage {
   action: "gptkResult";
   command: string;
@@ -136,6 +141,7 @@ export interface GptkProgressMessage extends BaseMessage {
   action: "gptkProgress";
   requestId: string;
   itemsProcessed: number;
+  totalItems?: number;
   message?: string;
   /** Set by batch operations (e.g. "trashItems") so the app can route progress correctly. */
   command?: string;
@@ -168,6 +174,7 @@ export type AppMessage =
   | TrashItemsMessage
   | TrashItemsResultMessage
   | GptkCommandMessage
+  | GptkCancelMessage
   | GptkResultMessage
   | GptkResultChunkMessage
   | GptkProgressMessage

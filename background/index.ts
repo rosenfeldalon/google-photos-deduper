@@ -36,6 +36,7 @@ interface PendingCommand {
 
 const appUrl = chrome.runtime.getURL("tabs/app.html")
 const pending = new Map<string, PendingCommand>()
+const detailRequests = new Map<string, { tabId: number; controller: AbortController }>()
 const PAIR_PREFIX = "photosPair:"
 const REQUEST_IDLE_MS = 90_000
 const CONNECT_ERROR = "Google Photos is disconnected. Reconnect and re-scan before continuing."
@@ -177,7 +178,7 @@ async function connect(app: AppTarget): Promise<void> {
   })
 }
 
-async function start(app: AppTarget, message: GptkCommandMessage): Promise<void> {
+async function start(app: AppTarget, message: GptkCommandMessage, signal?: AbortSignal): Promise<void> {
   if (typeof message.requestId !== "string" || !message.requestId || message.requestId.length > 128 ||
       typeof message.command !== "string" || message.command.length > 64) return
   const errorReply = (error: string) => replyToApp(app, {
@@ -192,12 +193,14 @@ async function start(app: AppTarget, message: GptkCommandMessage): Promise<void>
   }
   const key = PAIR_PREFIX + app.documentId
   const pairing = (await chrome.storage.session.get(key))[key] as Pairing | undefined
+  if (signal?.aborted) return
   if (!pairing || pairing.app.tabId !== app.tabId) {
     await errorReply(CONNECT_ERROR)
     return
   }
 
   const photos = await readPhotos(pairing.photos.tabId, pairing.photos.documentId)
+  if (signal?.aborted) return
   if (!sameAccount(photos, pairing)) {
     await errorReply(CONNECT_ERROR)
     return
@@ -270,6 +273,17 @@ async function relay(message: PhotosReply, source: DocumentTarget): Promise<bool
   return delivered
 }
 
+function cancelDetails(app: AppTarget, appRequestId: string): void {
+  detailRequests.get(app.documentId + ":" + appRequestId)?.controller.abort()
+  for (const [id, entry] of pending) {
+    if (entry.command !== "getItemDetails" || entry.pairing.app.documentId !== app.documentId ||
+        entry.pairing.app.tabId !== app.tabId || entry.appRequestId !== appRequestId) continue
+    finish(id)
+    void sendToDocument(entry.pairing.photos, { app: APP_ID, action: "gptkCancel", requestId: id }).catch(() => {})
+    return
+  }
+}
+
 chrome.runtime.onMessage.addListener((message: AppMessage, sender, respond) => {
   if (message?.app !== APP_ID) return
   const source = senderDocument(sender)
@@ -280,8 +294,24 @@ chrome.runtime.onMessage.addListener((message: AppMessage, sender, respond) => {
       void connect(app).then(() => respond(), () => respond())
       return true
     }
+    if (message.action === "gptkCancel") {
+      cancelDetails(app, message.requestId)
+      return
+    }
     if (message.action === "gptkCommand") {
-      void start(app, message).then(() => respond(), () => respond())
+      if (message.command === "getItemDetails" && typeof message.requestId === "string" &&
+          message.requestId.length <= 128) {
+        const key = app.documentId + ":" + message.requestId
+        if (detailRequests.has(key)) return
+        const controller = new AbortController()
+        detailRequests.set(key, { tabId: app.tabId, controller })
+        void start(app, message, controller.signal).catch(() => {}).finally(() => {
+          detailRequests.delete(key)
+          respond()
+        })
+      } else {
+        void start(app, message).then(() => respond(), () => respond())
+      }
       return true
     }
   } else if (isPhotosUrl(sender.url)) {
@@ -309,8 +339,14 @@ async function forgetTab(tabId: number): Promise<void> {
 }
 
 chrome.tabs.onRemoved.addListener(tabId => {
+  for (const { tabId: appTabId, controller } of detailRequests.values()) {
+    if (appTabId === tabId) controller.abort()
+  }
   for (const [id, entry] of pending) {
-    if (entry.pairing.app.tabId === tabId) finish(id)
+    if (entry.pairing.app.tabId === tabId) {
+      if (entry.command === "getItemDetails") cancelDetails(entry.pairing.app, entry.appRequestId)
+      else finish(id)
+    }
     else if (entry.pairing.photos.tabId === tabId) fail(id, CONNECT_ERROR)
   }
   void forgetTab(tabId).catch(() => {})

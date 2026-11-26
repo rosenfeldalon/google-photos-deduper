@@ -1,3 +1,4 @@
+import Button from "@mui/material/Button"
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react"
 import Alert from "@mui/material/Alert"
 import Box from "@mui/material/Box"
@@ -16,6 +17,8 @@ import StarIcon from "@mui/icons-material/Star"
 import DeleteSweepIcon from "@mui/icons-material/DeleteSweep"
 import Tooltip from "@mui/material/Tooltip"
 import { useBlobUrl } from "./useBlobUrl"
+import { AlbumChips } from "./AlbumChips"
+import type { PhotoDetailsEntry } from "../lib/photo-details"
 import { PhotoViewerModal } from "./PhotoViewerModal"
 import { buildThumbUrl } from "../lib/photo-url"
 import type { GpdMediaItem, DuplicateGroup } from "../lib/types"
@@ -152,6 +155,7 @@ interface DuplicateGroupRowProps {
   onOpenViewer: (group: DuplicateGroup, index: number) => void
   onMouseEnterPhoto: (group: DuplicateGroup, index: number) => void
   onMouseLeavePhoto: () => void
+  photoDetails?: ReadonlyMap<string, PhotoDetailsEntry>
 }
 
 const DuplicateGroupRow = memo(function DuplicateGroupRow({
@@ -165,6 +169,7 @@ const DuplicateGroupRow = memo(function DuplicateGroupRow({
   onOpenViewer,
   onMouseEnterPhoto,
   onMouseLeavePhoto,
+  photoDetails,
 }: DuplicateGroupRowProps) {
   const allTrashed = isWholeGroupTrashed(keptSet)
   return (
@@ -296,6 +301,7 @@ const DuplicateGroupRow = memo(function DuplicateGroupRow({
                         sx={sxStatusChip}
                       />
                     ) : null}
+                    <AlbumChips entry={photoDetails?.get(key)} />
                   </CardContent>
                 </CardActionArea>
               </Card>
@@ -348,6 +354,9 @@ interface DuplicateGroupsProps {
    * bounded. Above zero, results are incomplete and we say so.
    */
   bucketsSplit?: number
+  photoDetails?: ReadonlyMap<string, PhotoDetailsEntry>
+  onLoadAlbumInfo?: () => void
+  albumProgress?: { done: number; total: number } | null
 }
 
 export function DuplicateGroups({
@@ -359,6 +368,9 @@ export function DuplicateGroups({
   onToggleKept,
   onTrashWholeGroup,
   bucketsSplit = 0,
+  photoDetails,
+  onLoadAlbumInfo,
+  albumProgress,
 }: DuplicateGroupsProps) {
   // Measure time from first non-empty groups render to commit
   const renderLoggedRef = useRef(false)
@@ -492,6 +504,17 @@ export function DuplicateGroups({
         </Alert>
       )}
 
+      {onLoadAlbumInfo && (
+        <Button size="small" sx={{ mb: 1 }} onClick={onLoadAlbumInfo}>
+          Load album info
+        </Button>
+      )}
+      {albumProgress && (
+        <Typography variant="caption" role="status" color="text.secondary" sx={{ display: "block", mb: 1 }}>
+          Checked {albumProgress.done} of {albumProgress.total} photos for album information
+        </Typography>
+      )}
+
       {groups.slice(0, visibleCount).map((group) => (
         <DuplicateGroupRow
           key={group.id}
@@ -505,6 +528,7 @@ export function DuplicateGroups({
           onOpenViewer={onOpenViewer}
           onMouseEnterPhoto={onMouseEnterPhoto}
           onMouseLeavePhoto={onMouseLeavePhoto}
+          photoDetails={photoDetails}
         />
       ))}
 
@@ -517,6 +541,7 @@ export function DuplicateGroups({
           open={true}
           items={viewerItems}
           nextGroupItems={nextGroupItems}
+          photoDetails={photoDetails}
           initialIndex={viewerState.index}
           keptSet={keptByGroupId.get(viewerState.group.id)!}
           isGroupSelected={selectedGroupIds.has(viewerState.group.id)}
