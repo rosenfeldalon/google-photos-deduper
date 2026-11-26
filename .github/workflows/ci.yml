@@ -39,6 +39,9 @@ jobs:
       - name: Unit tests
         run: npm test
 
+      - name: Verify embedder worker bundle
+        run: npm run verify:worker
+
       # Build extension (required before integration tests)
       - name: Build extension
         run: npm run build
