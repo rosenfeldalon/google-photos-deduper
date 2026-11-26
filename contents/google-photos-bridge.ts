@@ -23,6 +23,8 @@ async function deliver(reply: PhotosReply): Promise<void> {
   if (await chrome.runtime.sendMessage(reply) !== true) throw new Error("Photos response was not acknowledged.")
 }
 
+const detailsRequests = new Map<string, AbortController>()
+
 async function run(message: IsolatedPhotosCommand): Promise<void> {
   const { command, args, requestId } = message
   const session = parsePhotosSession(message.session)
@@ -34,7 +36,30 @@ async function run(message: IsolatedPhotosCommand): Promise<void> {
     })
     return
   }
-  await executePhotosCommand(request, requestId, session.path, createPhotosApi(session), deliver)
+  const controller = new AbortController()
+  if (request.command === "getItemDetails") {
+    if (detailsRequests.size > 0) {
+      await deliver({
+        app: APP_ID, action: "gptkResult", command, requestId, success: false,
+        error: "Album information is already loading in this Photos tab.",
+      })
+      return
+    }
+    detailsRequests.set(requestId, controller)
+  }
+  try {
+    await executePhotosCommand(request, requestId, session.path, createPhotosApi(session), reply => {
+      // No detail RPCs remain after the final reply has been constructed. The
+      // app may already start the next page while Chrome acknowledges delivery.
+      if (reply.action === "gptkResult" ||
+          (reply.action === "gptkResultChunk" && reply.chunkIndex + 1 === reply.totalChunks)) {
+        detailsRequests.delete(requestId)
+      }
+      return deliver(reply)
+    }, controller.signal)
+  } finally {
+    detailsRequests.delete(requestId)
+  }
 }
 
 chrome.runtime.onMessage.addListener((message, sender, respond) => {
@@ -43,7 +68,12 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
     respond(true)
     return
   }
-  if (message.action !== "gptkCommand" || !isInternalRequestId(message.requestId)) return
+  if (!isInternalRequestId(message.requestId)) return
+  if (message.action === "gptkCancel") {
+    detailsRequests.get(message.requestId)?.abort()
+    return
+  }
+  if (message.action !== "gptkCommand") return
   void run(message).then(() => respond(), () => respond())
   return true
 })

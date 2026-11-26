@@ -36,6 +36,7 @@ import { createRequestId } from "../lib/photos-protocol"
 import { ScanLogger } from "../lib/scan-log"
 import theme from "../lib/theme"
 import { APP_ID, DEFAULT_SETTINGS } from "../lib/types"
+import { usePhotoDetails } from "../lib/use-photo-details"
 import {
   countFullyTrashedGroups,
   toggleWholeGroupTrashed
@@ -80,7 +81,8 @@ function sendToServiceWorker(message: AppMessage): void {
 export default function App() {
   const [state, dispatch] = useReducer(appReducer, { status: "connecting" })
   const [storageChecked, setStorageChecked] = useState(false)
-  const [photosConnected, setPhotosConnected] = useState(false)
+  const [photosAccount, setPhotosAccount] = useState<string | null>(null)
+  const photosConnected = photosAccount !== null
   const [settings, setSettings] = useReducer(
     (prev: ScanSettings, next: Partial<ScanSettings>) => ({ ...prev, ...next }),
     DEFAULT_SETTINGS
@@ -186,6 +188,7 @@ export default function App() {
       ? state.groups
       : null
   const groups = useMemo(() => stateGroups ?? [], [stateGroups])
+  const photoDetails = usePhotoDetails(photosAccount, groups, state.status === "results")
   useEffect(() => {
     if (pendingSelectionsRef.current) {
       const saved = pendingSelectionsRef.current
@@ -249,7 +252,7 @@ export default function App() {
       switch (message.action) {
         case "healthCheck.result": {
           const msg = message as HealthCheckResultMessage
-          setPhotosConnected(msg.success && msg.hasGptk)
+          setPhotosAccount(msg.success && msg.hasGptk ? msg.accountEmail ?? null : null)
           // Swallow early "failed" results and retry — when the app tab opens
           // before the bridge content script has fully loaded on a fresh
           // photos.google.com tab, or when the service worker has just woken
@@ -361,12 +364,13 @@ export default function App() {
         }
         case "gptkLog":
           if ((message as { level?: string }).level === "error") {
-            setPhotosConnected(false)
+            setPhotosAccount(null)
             dispatch({ type: "GP_TAB_CLOSED" })
           }
           break
         case "gptkProgress": {
           const progress = message as GptkProgressMessage
+          if (progress.command === "getItemDetails") break
           // Any fetch progress means the GP tab is still alive — reset the
           // silence timer.
           if (
@@ -731,7 +735,7 @@ export default function App() {
     currentScanRequestIdRef.current = null
     resultChunksRef.current = {}
     dispatch({ type: "RESET" })
-    setPhotosConnected(false)
+    setPhotosAccount(null)
     healthCheckAttemptsRef.current = 0
     sendToServiceWorker({ app: APP_ID, action: "healthCheck" })
   }, [clearFetchWatchdog])
@@ -897,6 +901,9 @@ export default function App() {
               onToggleKept={handleToggleKept}
               onTrashWholeGroup={handleTrashWholeGroup}
               bucketsSplit={state.bucketsSplit}
+              photoDetails={photoDetails.entries}
+              onLoadAlbumInfo={photoDetails.canLoadMore ? photoDetails.requestAll : undefined}
+              albumProgress={photoDetails.progress}
             />
           </>
         )}

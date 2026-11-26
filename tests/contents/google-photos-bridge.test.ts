@@ -3,6 +3,7 @@ import { APP_ID } from "../../lib/types"
 
 const api = vi.hoisted(() => ({
   getItemsByTakenDate: vi.fn(),
+  getItemInfoExt: vi.fn(),
   moveItemsToTrash: vi.fn(),
   restoreFromTrash: vi.fn(),
 }))
@@ -113,5 +114,25 @@ describe("isolated Photos bridge", () => {
     expect(sendMessage).toHaveBeenLastCalledWith(expect.objectContaining({
       action: "gptkResult", requestId: request.requestId, success: false,
     }))
+  })
+
+  it("starts the next album page while delivery of the previous final chunk is being acknowledged", async () => {
+    api.getItemInfoExt.mockResolvedValue({ albums: [] })
+    const firstId = "a".repeat(32)
+    let acknowledge: (result: boolean) => void = () => {}
+    sendMessage.mockImplementation(reply => {
+      if (reply.requestId === firstId && reply.action === "gptkResultChunk") {
+        return new Promise(resolve => { acknowledge = resolve })
+      }
+      return Promise.resolve(true)
+    })
+    const first = receive({ ...request, command: "getItemDetails", requestId: firstId, args: { mediaKeys: ["first"] } })
+    await vi.waitFor(() => expect(sendMessage).toHaveBeenCalledWith(expect.objectContaining({
+      requestId: firstId, action: "gptkResultChunk",
+    })))
+    await receive({ ...request, command: "getItemDetails", requestId: "b".repeat(32), args: { mediaKeys: ["second"] } })
+    acknowledge(true)
+    await first
+    expect(api.getItemInfoExt.mock.calls.map(([key]) => key)).toEqual(["first", "second"])
   })
 })
