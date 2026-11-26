@@ -87,6 +87,8 @@ npx playwright install chromium
 npm run test:integration
 ```
 
+If tests time out while running in parallel, run them with one worker using `npm run test:integration -- --workers=1`.
+
 ### Live Google Photos tests
 
 The full E2E suite can move photos to Trash and attempt to undo the move. Run it only against a disposable Google Photos test account containing expendable copies. It connects to a running Chrome instance via the [Chrome DevTools Protocol (CDP)](https://chromedevtools.github.io/devtools-protocol/). Start a dedicated Chrome profile with remote debugging.

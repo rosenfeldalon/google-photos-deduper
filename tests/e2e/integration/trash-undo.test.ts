@@ -176,7 +176,9 @@ test("undo after multi-batch trash restores all groups", async () => {
 // Error: trash API failure
 // ============================================================
 
-test("shows error state when trashItems fails", async () => {
+test("pauses after trash retries and keeps unacknowledged groups when stopped", async () => {
+  // The Toolkit retries each failed request before the trash batch runner retries it.
+  test.setTimeout(60_000)
   await clearStorage(context)
   const { groups, mediaItems } = smallPayload()
   await injectScanResults(context, groups, mediaItems, Object.keys(mediaItems).length)
@@ -192,13 +194,16 @@ test("shows error state when trashItems fails", async () => {
   await page.getByRole("button", { name: /Move \d+ Duplicates? to Trash/i }).click()
   await page.getByRole("button", { name: /Move to Trash/i }).last().click()
 
-  // TRASH_ERROR dispatches { status: "disconnected", error: "HTTP 504" }.
-  // The disconnected state shows the error string in an Alert and a "Retry Connection" button.
-  await expect(
-    page.getByRole("button", { name: /Retry Connection/i })
-  ).toBeVisible({ timeout: 10_000 })
-  // The raw error from the stub is surfaced in the Alert
-  await expect(page.getByText("HTTP 504")).toBeVisible()
+  await expect(page.getByText("Retrying batch 1. HTTP 504")).toBeVisible({ timeout: 15_000 })
+  await expect(page.getByRole("heading", { name: "Trash paused" })).toBeVisible({ timeout: 45_000 })
+  await expect(page.getByRole("alert")).toContainText("HTTP 504")
+  await expect(page.getByRole("alert")).toContainText("Check Photos before resuming.")
+  await expect(page.getByRole("button", { name: "Resume" })).toBeEnabled()
+  await expect(page.getByText("0 acknowledged · 3 remaining")).toBeVisible()
+
+  await page.getByRole("button", { name: "Stop" }).click()
+  await expect(page.getByText("3 Duplicate Groups Found")).toBeVisible()
+  await expect(page.getByText(/moved to trash/i)).not.toBeVisible()
 
   await stub.close()
   await page.close()
