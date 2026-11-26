@@ -12,6 +12,7 @@ function sendCommand(command: string, requestId: string, args: unknown) {
   if (!validated) throw new Error("Invalid test command")
   void executePhotosCommand(validated, requestId, window.location.pathname.match(/^\/u\/\d+\//)?.[0] ?? "/", {
     getItemsByTakenDate: scanApi.getItemsByTakenDate ?? vi.fn(),
+    getItemInfoExt: vi.fn(),
     moveItemsToTrash: mockMoveItemsToTrash,
     restoreFromTrash: mockRestoreFromTrash,
   }, (message) => { delivered.push(message) })

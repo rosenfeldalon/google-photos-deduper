@@ -1,3 +1,5 @@
+import { AlbumChips } from "./AlbumChips"
+import type { PhotoDetailsEntry } from "../lib/photo-details"
 import { useCallback, useState, useEffect } from "react"
 import { keyframes } from "@emotion/react"
 import Box from "@mui/material/Box"
@@ -139,6 +141,7 @@ export interface PhotoViewerModalProps {
   open: boolean
   items: GpdMediaItem[]
   nextGroupItems?: GpdMediaItem[]
+  photoDetails?: ReadonlyMap<string, PhotoDetailsEntry>
   initialIndex: number
   keptSet: Set<string>
   isGroupSelected: boolean
@@ -162,6 +165,7 @@ export function PhotoViewerModal({
   open,
   items,
   nextGroupItems = [],
+  photoDetails,
   initialIndex,
   keptSet,
   isGroupSelected,
@@ -334,6 +338,12 @@ export function PhotoViewerModal({
           </IconButton>
         </Box>
       </Box>
+
+      {photoDetails?.has(item.mediaKey) && (
+        <Box sx={{ px: 2, py: 0.75 }}>
+          <AlbumChips entry={photoDetails.get(item.mediaKey)} />
+        </Box>
+      )}
 
       {/* Image area with prev/next buttons */}
       <DialogContent

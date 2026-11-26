@@ -238,4 +238,19 @@ describe("Photos service worker", () => {
       20, expect.objectContaining({ requestId: "move", success: false }), appTarget
     )
   })
+
+  it("cancels album details while the document check is still in flight", async () => {
+    await healthCheck()
+    let continueProbe: (value: unknown) => void = () => {}
+    chromeMock.scripting.executeScript.mockImplementationOnce(() => new Promise(resolve => {
+      continueProbe = resolve
+    }))
+    const requestId = "cancelled-details"
+    const started = send({ action: "gptkCommand", command: "getItemDetails", requestId, args: { mediaKeys: ["a"] } })
+    await vi.waitFor(() => expect(chromeMock.scripting.executeScript).toHaveBeenCalledTimes(2))
+    await send({ action: "gptkCancel", requestId })
+    continueProbe([{ frameId: 0, documentId: "photos-doc", result: session }])
+    await started
+    expect(chromeMock.tabs.sendMessage.mock.calls.some(([, message]) => message.action === "gptkCommand")).toBe(false)
+  })
 })
