@@ -172,6 +172,18 @@ describe("Photos service worker", () => {
     expect(chromeMock.tabs.sendMessage).toHaveBeenLastCalledWith(20, expect.objectContaining({ success: false }), appTarget)
   })
 
+  it("rejects mutations and details associated with a different account", async () => {
+    await healthCheck()
+    chromeMock.scripting.executeScript.mockClear()
+    await send({ action: "gptkCommand", command: "trashItems", requestId: "old", args: { dedupKeys: ["a"] } })
+    await send({ action: "gptkCommand", command: "getItemDetails", requestId: "old",
+      accountEmail: "previous@example.test", args: { mediaKeys: ["a"] } })
+    expect(chromeMock.scripting.executeScript).not.toHaveBeenCalled()
+    expect(chromeMock.tabs.sendMessage).toHaveBeenLastCalledWith(
+      20, expect.objectContaining({ requestId: "old", success: false }), appTarget
+    )
+  })
+
   it("routes authenticated results only once and restores the app request ID", async () => {
     await healthCheck()
     const requestId = await scan()
@@ -225,7 +237,7 @@ describe("Photos service worker", () => {
 
   it("stops a mutation when the account changes during a batch", async () => {
     await healthCheck()
-    await send({ action: "gptkCommand", command: "trashItems", requestId: "move", args: { dedupKeys: ["a"] } })
+    await send({ action: "gptkCommand", command: "trashItems", requestId: "move", args: { dedupKeys: ["a"] }, accountEmail: session.account })
     const requestId = chromeMock.tabs.sendMessage.mock.calls.find(([, m]) =>
       m.action === "gptkCommand"
     )?.[1].requestId

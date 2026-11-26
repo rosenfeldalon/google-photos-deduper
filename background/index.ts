@@ -199,6 +199,11 @@ async function start(app: AppTarget, message: GptkCommandMessage, signal?: Abort
     return
   }
 
+  if ((command.command === "trashItems" || command.command === "restoreItems" || message.accountEmail !== undefined) &&
+      message.accountEmail !== pairing.account) {
+    await errorReply("The selection belongs to a different Photos account. Re-scan before trying again.")
+    return
+  }
   const photos = await readPhotos(pairing.photos.tabId, pairing.photos.documentId)
   if (signal?.aborted) return
   if (!sameAccount(photos, pairing)) {

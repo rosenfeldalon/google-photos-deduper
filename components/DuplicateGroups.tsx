@@ -19,6 +19,8 @@ import Tooltip from "@mui/material/Tooltip"
 import { useBlobUrl } from "./useBlobUrl"
 import { AlbumChips } from "./AlbumChips"
 import type { PhotoDetailsEntry } from "../lib/photo-details"
+import { mayManuallyTrash, type Provenance } from "../lib/photo-provenance"
+import { PhotoTrashCheckbox, ProvenanceBadge } from "./PhotoProvenance"
 import { PhotoViewerModal } from "./PhotoViewerModal"
 import { buildThumbUrl } from "../lib/photo-url"
 import type { GpdMediaItem, DuplicateGroup } from "../lib/types"
@@ -156,6 +158,8 @@ interface DuplicateGroupRowProps {
   onMouseEnterPhoto: (group: DuplicateGroup, index: number) => void
   onMouseLeavePhoto: () => void
   photoDetails?: ReadonlyMap<string, PhotoDetailsEntry>
+  provenanceByKey?: ReadonlyMap<string, Provenance>
+  selectionReady: boolean
 }
 
 const DuplicateGroupRow = memo(function DuplicateGroupRow({
@@ -170,19 +174,29 @@ const DuplicateGroupRow = memo(function DuplicateGroupRow({
   onMouseEnterPhoto,
   onMouseLeavePhoto,
   photoDetails,
+  provenanceByKey,
+  selectionReady,
 }: DuplicateGroupRowProps) {
-  const allTrashed = isWholeGroupTrashed(keptSet)
+  const ordinaryOwn = provenanceByKey && group.mediaKeys.filter(key => provenanceByKey.get(key) === "mine")
+  const groupCanToggle = !provenanceByKey || (selectionReady && group.mediaKeys.some(key => !keptSet.has(key)))
+  const wholeGroupEnabled = !provenanceByKey || (selectionReady && !!ordinaryOwn?.length)
+  const allTrashed = ordinaryOwn
+    ? ordinaryOwn.length > 0 && isSelected && ordinaryOwn.every(key => !keptSet.has(key))
+    : isWholeGroupTrashed(keptSet)
+  const mixed = provenanceByKey && group.mediaKeys.some(key => !mayManuallyTrash(provenanceByKey.get(key) ?? "unknown"))
   return (
     <Paper
       variant="outlined"
       sx={[sxPaperBase, { opacity: isSelected ? 1 : 0.55 }]}>
       {/* Group header */}
       <Box
-        onClick={() => onToggleGroup(group.id)}
+        onClick={groupCanToggle ? () => onToggleGroup(group.id) : undefined}
         sx={sxGroupHeader}>
         <Checkbox
           size="small"
           checked={isSelected}
+          disabled={!groupCanToggle}
+          inputProps={{ "aria-label": "Select eligible photos in this group" }}
           onChange={() => onToggleGroup(group.id)}
           onClick={(e) => e.stopPropagation()}
           sx={sxCheckbox}
@@ -198,18 +212,22 @@ const DuplicateGroupRow = memo(function DuplicateGroupRow({
         />
         <Tooltip
           title={
-            allTrashed
-              ? "Keep the best photo again"
-              : "Trash every photo in this group"
+            !wholeGroupEnabled
+              ? "No confirmed personal photos are eligible for group selection."
+              : allTrashed
+                ? "Keep the best photo again"
+                : provenanceByKey ? "Select all eligible personal photos" : "Trash every photo in this group"
           }>
           {/* stopPropagation: the header itself toggles group selection */}
+          <span>
           <IconButton
             size="small"
+            disabled={!wholeGroupEnabled}
             data-testid={`trash-whole-group-${group.id}`}
             aria-label={
               allTrashed
                 ? "Keep the best photo in this group"
-                : "Trash every photo in this group"
+                : provenanceByKey ? "Select all eligible personal photos" : "Trash every photo in this group"
             }
             aria-pressed={allTrashed}
             color={allTrashed ? "error" : "default"}
@@ -219,15 +237,22 @@ const DuplicateGroupRow = memo(function DuplicateGroupRow({
             }}>
             <DeleteSweepIcon fontSize="small" />
           </IconButton>
+          </span>
         </Tooltip>
       </Box>
 
+      {mixed && (
+        <Alert severity="info" sx={{ mb: 1 }}>
+          Mixed ownership. Shared and unverified copies stay protected.
+        </Alert>
+      )}
       {/* Thumbnails */}
       <Box sx={sxThumbnailsWrapper}>
         {group.mediaKeys.map((key, itemIndex) => {
           const item = mediaItems[key]
           if (!item) return null
           const isKept = keptSet.has(key)
+          const kind = provenanceByKey?.get(key) ?? "unknown"
 
           return (
             <Box
@@ -241,7 +266,9 @@ const DuplicateGroupRow = memo(function DuplicateGroupRow({
                   borderColor: isKept ? "primary.main" : "divider",
                   borderWidth: isKept ? 2 : 1,
                 }]}>
-                <CardActionArea onClick={() => onToggleKept(group, key)}>
+                <CardActionArea
+                  disabled={!!provenanceByKey && (!selectionReady || !mayManuallyTrash(kind))}
+                  onClick={() => onToggleKept(group, key)}>
                   <ThumbnailImage
                     src={buildThumbUrl(item.thumb, { height: 200 })}
                     alt={item.fileName || item.mediaKey}
@@ -301,9 +328,19 @@ const DuplicateGroupRow = memo(function DuplicateGroupRow({
                         sx={sxStatusChip}
                       />
                     ) : null}
+                    {provenanceByKey && <ProvenanceBadge kind={kind} item={item} entry={photoDetails?.get(key)} />}
                     <AlbumChips entry={photoDetails?.get(key)} />
                   </CardContent>
                 </CardActionArea>
+                {provenanceByKey && (
+                  <Box sx={{ px: 1, pb: 0.5 }}>
+                    <PhotoTrashCheckbox
+                      kind={kind} ready={selectionReady} checked={isSelected && !isKept}
+                      label={item.fileName || key}
+                      onChange={() => onToggleKept(group, key)}
+                    />
+                  </Box>
+                )}
               </Card>
 
               {/*
@@ -357,6 +394,8 @@ interface DuplicateGroupsProps {
   photoDetails?: ReadonlyMap<string, PhotoDetailsEntry>
   onLoadAlbumInfo?: () => void
   albumProgress?: { done: number; total: number } | null
+  provenanceByKey?: ReadonlyMap<string, Provenance>
+  selectionReady?: boolean
 }
 
 export function DuplicateGroups({
@@ -371,6 +410,8 @@ export function DuplicateGroups({
   photoDetails,
   onLoadAlbumInfo,
   albumProgress,
+  provenanceByKey,
+  selectionReady = true,
 }: DuplicateGroupsProps) {
   // Measure time from first non-empty groups render to commit
   const renderLoggedRef = useRef(false)
@@ -529,6 +570,8 @@ export function DuplicateGroups({
           onMouseEnterPhoto={onMouseEnterPhoto}
           onMouseLeavePhoto={onMouseLeavePhoto}
           photoDetails={photoDetails}
+          provenanceByKey={provenanceByKey}
+          selectionReady={selectionReady}
         />
       ))}
 
@@ -542,6 +585,8 @@ export function DuplicateGroups({
           items={viewerItems}
           nextGroupItems={nextGroupItems}
           photoDetails={photoDetails}
+          provenanceByKey={provenanceByKey}
+          selectionReady={selectionReady}
           initialIndex={viewerState.index}
           keptSet={keptByGroupId.get(viewerState.group.id)!}
           isGroupSelected={selectedGroupIds.has(viewerState.group.id)}

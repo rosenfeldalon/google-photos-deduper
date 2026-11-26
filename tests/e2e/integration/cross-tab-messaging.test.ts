@@ -362,6 +362,7 @@ test.describe("progress streaming", () => {
           action: "gptkCommand",
           command: "trashItems",
           requestId,
+          accountEmail: "test@example.com",
           args: { dedupKeys },
         })
       })

@@ -1,5 +1,7 @@
 import { AlbumChips } from "./AlbumChips"
 import type { PhotoDetailsEntry } from "../lib/photo-details"
+import { mayManuallyTrash, type Provenance } from "../lib/photo-provenance"
+import { PhotoTrashCheckbox, ProvenanceBadge } from "./PhotoProvenance"
 import { useCallback, useState, useEffect } from "react"
 import { keyframes } from "@emotion/react"
 import Box from "@mui/material/Box"
@@ -142,6 +144,8 @@ export interface PhotoViewerModalProps {
   items: GpdMediaItem[]
   nextGroupItems?: GpdMediaItem[]
   photoDetails?: ReadonlyMap<string, PhotoDetailsEntry>
+  provenanceByKey?: ReadonlyMap<string, Provenance>
+  selectionReady?: boolean
   initialIndex: number
   keptSet: Set<string>
   isGroupSelected: boolean
@@ -166,6 +170,8 @@ export function PhotoViewerModal({
   items,
   nextGroupItems = [],
   photoDetails,
+  provenanceByKey,
+  selectionReady = true,
   initialIndex,
   keptSet,
   isGroupSelected,
@@ -229,13 +235,15 @@ export function PhotoViewerModal({
         } else if (e.key === "ArrowUp") {
           e.preventDefault()
           const item = items[Math.min(index, items.length - 1)]
-          if (item && !keptSet.has(item.mediaKey)) {
+          if (item && !keptSet.has(item.mediaKey) &&
+              (!provenanceByKey || (selectionReady && mayManuallyTrash(provenanceByKey.get(item.mediaKey) ?? "unknown")))) {
             onToggleKept?.(item.mediaKey)
           }
         } else if (e.key === "ArrowDown") {
           e.preventDefault()
           const item = items[Math.min(index, items.length - 1)]
-          if (item && keptSet.has(item.mediaKey)) {
+          if (item && keptSet.has(item.mediaKey) &&
+              (!provenanceByKey || (selectionReady && mayManuallyTrash(provenanceByKey.get(item.mediaKey) ?? "unknown")))) {
             onToggleKept?.(item.mediaKey)
           }
         }
@@ -243,7 +251,7 @@ export function PhotoViewerModal({
     }
     window.addEventListener("keydown", handler)
     return () => window.removeEventListener("keydown", handler)
-  }, [open, index, items, keptSet, isGroupSelected, onToggleKept, onToggleGroup, onNextGroup, onPrevGroup])
+  }, [open, index, items, keptSet, isGroupSelected, onToggleKept, onToggleGroup, onNextGroup, onPrevGroup, provenanceByKey, selectionReady])
 
   if (items.length === 0) return null
 
@@ -339,9 +347,20 @@ export function PhotoViewerModal({
         </Box>
       </Box>
 
-      {photoDetails?.has(item.mediaKey) && (
-        <Box sx={{ px: 2, py: 0.75 }}>
-          <AlbumChips entry={photoDetails.get(item.mediaKey)} />
+      {(provenanceByKey || photoDetails?.has(item.mediaKey)) && (
+        <Box sx={{ px: 2, py: 0.75, display: "flex", gap: 1, alignItems: "center", flexWrap: "wrap" }}>
+          {provenanceByKey && (
+            <>
+              <ProvenanceBadge kind={provenanceByKey.get(item.mediaKey) ?? "unknown"} item={item} entry={photoDetails?.get(item.mediaKey)} />
+              <PhotoTrashCheckbox
+                kind={provenanceByKey.get(item.mediaKey) ?? "unknown"}
+                ready={selectionReady} checked={isGroupSelected && !isKept}
+                label={item.fileName || item.mediaKey}
+                onChange={() => onToggleKept?.(item.mediaKey)}
+              />
+            </>
+          )}
+          <AlbumChips entry={photoDetails?.get(item.mediaKey)} />
         </Box>
       )}
 

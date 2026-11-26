@@ -10,3 +10,5 @@ The extension uses Chrome's extension messaging to keep Photos commands, media k
 Each media result message is capped at 8 MiB and 10,000 items. Mutation inputs accept at most 10,000 unique keys with no key longer than 1,024 characters. GPTK still sends 250 keys per mutation request.
 
 Page session fields are untrusted. A compromised page can alter its own session data or act within its existing Google Photos session. The boundary prevents it from invoking extension commands or reading extension messages through page events. It cannot revoke an RPC that Google already received. A lost acknowledgement stops later batches, so inspect Photos before retrying a mutation with an uncertain outcome.
+
+The app only builds trash commands from verified ownership in a scan of the connected account. Owner confirmation is stored per account. Candidate inference needs at least 20 distinct photos marked owned and at least 95% agreement. Missing or conflicting evidence protects the photo. A dedup key that also matches an unselected or protected photo anywhere in the scan is skipped before confirmation. The service worker checks the originating account for both trash and undo.
