@@ -34,6 +34,10 @@ import {
 import type { Provenance } from "../lib/photo-provenance"
 import { createRequestId } from "../lib/photos-protocol"
 import { ScanLogger } from "../lib/scan-log"
+import {
+  applyTrashBatchState, createTrashOperation, nextTrashRequest, trashAcknowledged, trashWatchdog,
+  type TrashOperation
+} from "../lib/trash-operation"
 import theme from "../lib/theme"
 import { APP_ID, DEFAULT_SETTINGS } from "../lib/types"
 import { usePhotoDetails } from "../lib/use-photo-details"
@@ -100,21 +104,72 @@ export default function App() {
   const [manualShared, setManualShared] = useState<Set<string>>(new Set())
   const [trashNotice, setTrashNotice] = useState<string>()
 
-  type Snapshot = {
-    mediaItems: Record<string, GpdMediaItem>
-    groups: DuplicateGroup[]
-    totalItems: number
-  }
-  type TrashOperation = {
-    requestId: string
+  const [undoData, setUndoData] = useState<{
     account: string
     dedupKeys: string[]
     count: number
-    snapshot: Snapshot
-    progressCounts: number[]
-  }
-  const [undoData, setUndoData] = useState<TrashOperation | null>(null)
+    snapshot: TrashOperation["snapshot"]
+  } | null>(null)
   const pendingTrashRef = useRef<TrashOperation | null>(null)
+
+  const finishTrash = useCallback((operation: TrashOperation) => {
+    const { dedupKeys, mediaKeys } = trashAcknowledged(operation)
+    pendingTrashRef.current = null
+    dispatch({ type: "TRASH_COMPLETE", trashedKeys: mediaKeys })
+    if (dedupKeys.length) {
+      setUndoData({ account: operation.account, dedupKeys, count: mediaKeys.length, snapshot: operation.snapshot })
+    }
+    if (operation.uncertain) {
+      setTrashNotice("The final batch could still have moved photos. Re-scan before starting a different selection.")
+    }
+  }, [])
+
+  const pauseTrash = useCallback((operation: TrashOperation, message: string, waiting: boolean) => {
+    dispatch({
+      type: "TRASH_PROGRESS", trashedSoFar: trashAcknowledged(operation).mediaKeys.length,
+    })
+    dispatch({ type: "TRASH_PAUSED", message, waiting, uncertain: operation.uncertain })
+  }, [])
+
+  const cancelTrash = useCallback((stop: boolean, message: string) => {
+    const operation = pendingTrashRef.current
+    if (!operation) return
+    operation.stopRequested ||= stop
+    const active = operation.active
+    if (!active) {
+      if (stop) finishTrash(operation)
+      return
+    }
+    pauseTrash(operation, message, true)
+    const noAcknowledgement = () => {
+      if (pendingTrashRef.current !== operation || operation.active !== active) return
+      operation.active = null
+      operation.uncertain = true
+      setPhotosAccount(null)
+      if (operation.stopRequested) finishTrash(operation)
+      else pauseTrash(operation, "The Photos bridge could not confirm that the attempt stopped.", false)
+    }
+    void chrome.runtime.sendMessage({ app: APP_ID, action: "gptkCancel", requestId: active.id })
+      .then(reply => { if (reply !== true) noAcknowledgement() }, noAcknowledgement)
+  }, [finishTrash, pauseTrash])
+
+  const watchdog = useMemo(() => trashWatchdog(() =>
+    cancelTrash(false, "No trash batch was acknowledged in 90 seconds. Stopping the current attempt.")
+  ), [cancelTrash])
+  useEffect(() => watchdog.clear, [watchdog])
+
+  const sendTrashRun = useCallback((operation: TrashOperation) => {
+    const message = nextTrashRequest(operation, createRequestId())
+    if (!message) return
+    watchdog.arm()
+    void chrome.runtime.sendMessage(message).catch(() => {
+      if (pendingTrashRef.current !== operation || operation.active?.id !== message.requestId) return
+      watchdog.clear()
+      operation.active = null
+      operation.uncertain = true
+      pauseTrash(operation, "The Photos bridge lost the trash response.", false)
+    })
+  }, [pauseTrash, watchdog])
 
   // AbortController for the current scan (cancelled on user request or new scan)
   const scanAbortRef = useRef<AbortController | null>(null)
@@ -189,7 +244,6 @@ export default function App() {
   useEffect(() => {
     setManualShared(new Set())
     setTrashConfirm(null)
-    setTrashNotice(undefined)
   }, [resultsAccount, groups])
   useEffect(() => {
     if (pendingSelectionsRef.current) {
@@ -321,17 +375,17 @@ export default function App() {
             }
           } else if (result.command === "trashItems") {
             const operation = pendingTrashRef.current
-            if (!operation || operation.requestId !== result.requestId) break
-            pendingTrashRef.current = null
-            if (result.success) {
-              const data = result.data as { trashedKeys: string[] }
-              dispatch({ type: "TRASH_COMPLETE", trashedKeys: data.trashedKeys || [] })
-              setUndoData(operation)
+            if (!operation || operation.active?.id !== result.requestId) break
+            watchdog.clear()
+            const batch = result.data
+            const accepted = applyTrashBatchState(operation, batch)
+            if (!accepted) operation.uncertain = true
+            operation.active = null
+            if (operation.stopRequested || operation.acknowledged.size === operation.guardedKeys.length) {
+              finishTrash(operation)
             } else {
-              dispatch({
-                type: "TRASH_ERROR",
-                error: result.error || "Trash failed"
-              })
+              const error = accepted && batch.error ? batch.error : result.error
+              pauseTrash(operation, error ?? "The trash operation paused before all photos were confirmed.", false)
             }
           } else if (result.command === "restoreItems") {
             if (!result.success) {
@@ -344,7 +398,14 @@ export default function App() {
         case "gptkLog":
           if ((message as { level?: string }).level === "error") {
             setPhotosAccount(null)
-            dispatch({ type: "GP_TAB_CLOSED" })
+            const operation = pendingTrashRef.current
+            if (operation) {
+              watchdog.clear()
+              operation.active = null
+              operation.uncertain = true
+              if (operation.stopRequested) finishTrash(operation)
+              else pauseTrash(operation, "The Photos tab was closed. Reconnect to continue.", false)
+            } else dispatch({ type: "GP_TAB_CLOSED" })
           }
           break
         case "gptkProgress": {
@@ -361,9 +422,17 @@ export default function App() {
           if (progress.command === "getAllMediaItems" && progress.requestId !== currentScanRequestIdRef.current) break
           if (progress.command === "trashItems") {
             const operation = pendingTrashRef.current
-            if (!operation || operation.requestId !== progress.requestId) break
-            const trashedSoFar = operation.progressCounts[progress.itemsProcessed - 1]
-            if (trashedSoFar !== undefined) dispatch({ type: "TRASH_PROGRESS", trashedSoFar })
+            if (!operation || operation.active?.id !== progress.requestId) break
+            const previous = operation.acknowledged.size
+            const batch = progress.trashState
+            if (!applyTrashBatchState(operation, batch)) break
+            if (operation.acknowledged.size > previous) watchdog.arm()
+            dispatch({
+              type: "TRASH_PROGRESS", trashedSoFar: trashAcknowledged(operation).mediaKeys.length,
+              retrying: batch.outcome === "retrying" && batch.failedBatchIndex !== null
+                ? `Retrying batch ${batch.failedBatchIndex + 1}. ${batch.error ?? ""}`
+                : undefined,
+            })
           } else if (progress.command === "restoreItems") {
             console.log(`[GPD] restore progress: ${progress.itemsProcessed}`)
           } else {
@@ -376,7 +445,7 @@ export default function App() {
 
     chrome.runtime.onMessage.addListener(listener)
     return () => chrome.runtime.onMessage.removeListener(listener)
-  }, [armFetchWatchdog, clearFetchWatchdog])
+  }, [armFetchWatchdog, clearFetchWatchdog, finishTrash, pauseTrash, watchdog])
 
   // Keep refs so async callbacks always see latest values
   const settingsRef = useRef(settings)
@@ -734,23 +803,11 @@ export default function App() {
     const { dedupKeys, mediaKeysToTrash } = checked
     setTrashConfirm(null)
 
-    const requestId = createRequestId()
-
-    const copiesByDedup = new Map<string, number>()
-    for (const key of mediaKeysToTrash) {
-      const id = state.mediaItems[key].dedupKey
-      copiesByDedup.set(id, (copiesByDedup.get(id) ?? 0) + 1)
-    }
-    let movedSoFar = 0
-    pendingTrashRef.current = {
-      requestId,
-      account: checked.account,
-      dedupKeys,
-      count: mediaKeysToTrash.length,
-      progressCounts: dedupKeys.map(id => movedSoFar += copiesByDedup.get(id) ?? 0),
-      snapshot: { mediaItems: state.mediaItems, groups: state.groups, totalItems: state.totalItems },
-    }
-
+    const operation = createTrashOperation(checked.account, dedupKeys, mediaKeysToTrash, {
+      mediaItems: state.mediaItems, groups: state.groups, totalItems: state.totalItems,
+    })
+    pendingTrashRef.current = operation
+    setUndoData(null)
     dispatch({
       type: "TRASH_STARTED",
       totalToTrash: mediaKeysToTrash.length,
@@ -758,16 +815,21 @@ export default function App() {
       groups: state.groups,
       totalItems: state.totalItems
     })
+    sendTrashRun(operation)
+  }, [buildTrashPlan, sendTrashRun, trashConfirm, state])
 
-    sendToServiceWorker({
-      app: APP_ID,
-      action: "gptkCommand",
-      command: "trashItems",
-      requestId,
-      args: { dedupKeys, mediaKeysToTrash },
-      accountEmail: checked.account
-    })
-  }, [buildTrashPlan, trashConfirm, state])
+  const handleStopTrash = useCallback(() => {
+    watchdog.clear()
+    cancelTrash(true, "Stopping the current Photos batch.")
+  }, [cancelTrash, watchdog])
+
+  const handleResumeTrash = useCallback(() => {
+    const operation = pendingTrashRef.current
+    if (!operation || operation.active || operation.account !== photosAccount ||
+        state.status !== "trash-paused" || state.waiting) return
+    dispatch({ type: "TRASH_RESUMED" })
+    sendTrashRun(operation)
+  }, [photosAccount, sendTrashRun, state])
 
   const handleCancelScan = useCallback(() => {
     scanAbortRef.current?.abort()
@@ -783,6 +845,7 @@ export default function App() {
     resultChunksRef.current = {}
     dispatch({ type: "RESET" })
     setPhotosAccount(null)
+    setTrashNotice(undefined)
     healthCheckAttemptsRef.current = 0
     sendToServiceWorker({ app: APP_ID, action: "healthCheck" })
   }, [clearFetchWatchdog])
@@ -975,21 +1038,44 @@ export default function App() {
 
         {state.status === "trashing" && (
           <Box sx={{ maxWidth: 480, mx: "auto", p: 4 }}>
-            <Typography variant="h5" fontWeight={600} gutterBottom>
-              Moving to Trash
-            </Typography>
+            <Typography variant="h5" fontWeight={600} gutterBottom>Moving to Trash</Typography>
             <Box sx={{ display: "flex", alignItems: "center", gap: 1, mb: 2 }}>
               <CircularProgress size={14} thickness={5} />
               <Typography variant="body2" color="text.secondary">
-                {state.trashedSoFar > 0
-                  ? `${state.trashedSoFar.toLocaleString()} of ${state.totalToTrash.toLocaleString()} moved`
-                  : "Starting…"}
+                {state.trashedSoFar.toLocaleString()} of {state.totalToTrash.toLocaleString()} acknowledged
               </Typography>
             </Box>
             <LinearProgress
               variant={state.trashedSoFar > 0 ? "determinate" : "indeterminate"}
               value={Math.round((state.trashedSoFar / state.totalToTrash) * 100)}
             />
+            {state.retrying && <Typography variant="body2" sx={{ mt: 1 }}>{state.retrying}</Typography>}
+            <Button onClick={handleStopTrash} sx={{ mt: 2 }}>Stop</Button>
+          </Box>
+        )}
+
+        {state.status === "trash-paused" && (
+          <Box sx={{ maxWidth: 560, mx: "auto", p: 4 }}>
+            <Typography variant="h5" fontWeight={600} gutterBottom>Trash paused</Typography>
+            <Typography variant="body2" sx={{ mb: 1 }}>
+              {state.trashedSoFar.toLocaleString()} acknowledged · {(state.totalToTrash - state.trashedSoFar).toLocaleString()} remaining
+            </Typography>
+            <Alert severity={state.uncertain ? "warning" : "info"} sx={{ mb: 2 }}>
+              {state.message}{state.uncertain && " The last batch may have moved photos. Check Photos before resuming."}
+            </Alert>
+            <Box sx={{ display: "flex", flexWrap: "wrap", gap: 1 }}>
+              <Button
+                variant="contained"
+                disabled={state.waiting || state.accountEmail !== photosAccount}
+                onClick={handleResumeTrash}
+              >
+                Resume
+              </Button>
+              <Button onClick={handleStopTrash}>Stop</Button>
+              {state.accountEmail !== photosAccount && (
+                <Button onClick={() => sendToServiceWorker({ app: APP_ID, action: "healthCheck" })}>Reconnect</Button>
+              )}
+            </Box>
           </Box>
         )}
       </Box>

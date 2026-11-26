@@ -36,7 +36,7 @@ interface PendingCommand {
 
 const appUrl = chrome.runtime.getURL("tabs/app.html")
 const pending = new Map<string, PendingCommand>()
-const detailRequests = new Map<string, { tabId: number; controller: AbortController }>()
+const cancellableRequests = new Map<string, { tabId: number; controller: AbortController }>()
 const PAIR_PREFIX = "photosPair:"
 const REQUEST_IDLE_MS = 90_000
 const CONNECT_ERROR = "Google Photos is disconnected. Reconnect and re-scan before continuing."
@@ -140,10 +140,16 @@ function finish(id: string): void {
   pending.delete(id)
 }
 
+function signalCancellation(entry: PendingCommand, id: string): Promise<boolean> {
+  return sendToDocument(entry.pairing.photos, { app: APP_ID, action: "gptkCancel", requestId: id })
+    .then(response => response === true, () => false)
+}
+
 function fail(id: string, error: string): void {
   const entry = pending.get(id)
   if (!entry) return
   finish(id)
+  if (entry.command === "trashItems") void signalCancellation(entry, id)
   void replyToApp(entry.pairing.app, {
     app: APP_ID, action: "gptkResult", command: entry.command,
     requestId: entry.appRequestId, success: false, error,
@@ -191,9 +197,19 @@ async function start(app: AppTarget, message: GptkCommandMessage, signal?: Abort
     await errorReply("Invalid Photos command or arguments.")
     return
   }
+  async function stoppedBeforeDispatch() {
+    if (command?.command !== "trashItems") return
+    await replyToApp(app, {
+      app: APP_ID, action: "gptkResult", command: "trashItems", requestId: message.requestId, success: false,
+      data: {
+        outcome: "stopped", acknowledgedKeys: [], remainingKeys: command.dedupKeys,
+        failedBatchIndex: null, uncertain: false, trashedCount: 0, trashedKeys: [],
+      },
+    })
+  }
   const key = PAIR_PREFIX + app.documentId
   const pairing = (await chrome.storage.session.get(key))[key] as Pairing | undefined
-  if (signal?.aborted) return
+  if (signal?.aborted) return stoppedBeforeDispatch()
   if (!pairing || pairing.app.tabId !== app.tabId) {
     await errorReply(CONNECT_ERROR)
     return
@@ -205,7 +221,7 @@ async function start(app: AppTarget, message: GptkCommandMessage, signal?: Abort
     return
   }
   const photos = await readPhotos(pairing.photos.tabId, pairing.photos.documentId)
-  if (signal?.aborted) return
+  if (signal?.aborted) return stoppedBeforeDispatch()
   if (!sameAccount(photos, pairing)) {
     await errorReply(CONNECT_ERROR)
     return
@@ -278,15 +294,17 @@ async function relay(message: PhotosReply, source: DocumentTarget): Promise<bool
   return delivered
 }
 
-function cancelDetails(app: AppTarget, appRequestId: string): void {
-  detailRequests.get(app.documentId + ":" + appRequestId)?.controller.abort()
+async function cancelCommand(app: AppTarget, appRequestId: string, discard = false): Promise<boolean> {
+  const preparing = cancellableRequests.get(app.documentId + ":" + appRequestId)
+  preparing?.controller.abort()
   for (const [id, entry] of pending) {
-    if (entry.command !== "getItemDetails" || entry.pairing.app.documentId !== app.documentId ||
+    if ((entry.command !== "getItemDetails" && entry.command !== "trashItems") ||
+        entry.pairing.app.documentId !== app.documentId ||
         entry.pairing.app.tabId !== app.tabId || entry.appRequestId !== appRequestId) continue
-    finish(id)
-    void sendToDocument(entry.pairing.photos, { app: APP_ID, action: "gptkCancel", requestId: id }).catch(() => {})
-    return
+    if (discard || entry.command === "getItemDetails") finish(id)
+    return signalCancellation(entry, id)
   }
+  return preparing !== undefined
 }
 
 chrome.runtime.onMessage.addListener((message: AppMessage, sender, respond) => {
@@ -300,18 +318,19 @@ chrome.runtime.onMessage.addListener((message: AppMessage, sender, respond) => {
       return true
     }
     if (message.action === "gptkCancel") {
-      cancelDetails(app, message.requestId)
-      return
+      void cancelCommand(app, message.requestId).then(respond, () => respond(false))
+      return true
     }
     if (message.action === "gptkCommand") {
-      if (message.command === "getItemDetails" && typeof message.requestId === "string" &&
+      if ((message.command === "getItemDetails" || message.command === "trashItems") &&
+          typeof message.requestId === "string" &&
           message.requestId.length <= 128) {
         const key = app.documentId + ":" + message.requestId
-        if (detailRequests.has(key)) return
+        if (cancellableRequests.has(key)) return
         const controller = new AbortController()
-        detailRequests.set(key, { tabId: app.tabId, controller })
+        cancellableRequests.set(key, { tabId: app.tabId, controller })
         void start(app, message, controller.signal).catch(() => {}).finally(() => {
-          detailRequests.delete(key)
+          cancellableRequests.delete(key)
           respond()
         })
       } else {
@@ -344,13 +363,14 @@ async function forgetTab(tabId: number): Promise<void> {
 }
 
 chrome.tabs.onRemoved.addListener(tabId => {
-  for (const { tabId: appTabId, controller } of detailRequests.values()) {
+  for (const { tabId: appTabId, controller } of cancellableRequests.values()) {
     if (appTabId === tabId) controller.abort()
   }
   for (const [id, entry] of pending) {
     if (entry.pairing.app.tabId === tabId) {
-      if (entry.command === "getItemDetails") cancelDetails(entry.pairing.app, entry.appRequestId)
-      else finish(id)
+      if (entry.command === "getItemDetails" || entry.command === "trashItems") {
+        void cancelCommand(entry.pairing.app, entry.appRequestId, true)
+      } else finish(id)
     }
     else if (entry.pairing.photos.tabId === tabId) fail(id, CONNECT_ERROR)
   }
